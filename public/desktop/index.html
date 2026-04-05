@@ -96,6 +96,7 @@
     const MAX_RECONNECT_ATTEMPTS = 10;
 
     async function init() {
+      try {
       // Create a session
       const res = await fetch('/api/session', { method: 'POST' });
       const data = await res.json();
@@ -112,9 +113,24 @@
         width: 250,
         margin: 2,
         color: { dark: '#1a1a2e', light: '#ffffff' }
+      }, (err) => {
+        if (err) {
+          // QR library failed — show URL as text fallback
+          document.getElementById('pairingInfo').innerHTML =
+            'QR render failed. Open this URL on your phone:<br><code style="word-break:break-all;font-size:0.75rem">' + esc(phoneUrl) + '</code>';
+        }
       });
 
+      // Also show the URL below the QR code for manual entry
+      document.getElementById('pairingInfo').innerHTML =
+        'Point your phone camera at this QR code<br><small style="color:#aaa;word-break:break-all">' + esc(phoneUrl) + '</small>';
+
       connectWebSocket();
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        document.getElementById('pairingInfo').textContent = 'Failed to create session. Check console for details.';
+        console.error('Init error:', err);
+      }
     }
 
     function connectWebSocket() {
