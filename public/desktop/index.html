@@ -32,6 +32,23 @@
     .scan-card .detail span { font-size: 0.95rem; font-weight: 500; }
     .empty-state { text-align: center; padding: 4rem 2rem; color: #999; }
     .empty-state .icon { font-size: 3rem; margin-bottom: 1rem; }
+    /* BMP Medication Plan styles */
+    .scan-card.bmp { border-left: 4px solid #007bff; }
+    .scan-card.bmp .medicine-name { color: #007bff; }
+    .bmp-patient { background: #e8f4fd; padding: 0.8rem; border-radius: 8px; margin: 0.5rem 0; }
+    .bmp-patient .label { font-size: 0.7rem; text-transform: uppercase; color: #666; }
+    .bmp-patient .value { font-weight: 500; }
+    .bmp-section { margin-top: 0.8rem; }
+    .bmp-section-title { font-size: 0.85rem; font-weight: 600; color: #555; padding: 0.3rem 0; border-bottom: 1px solid #eee; margin-bottom: 0.4rem; }
+    .bmp-med { display: grid; grid-template-columns: 1fr auto; gap: 0.5rem; padding: 0.5rem 0; border-bottom: 1px solid #f0f0f0; }
+    .bmp-med:last-child { border-bottom: none; }
+    .bmp-med-name { font-weight: 500; font-size: 0.95rem; }
+    .bmp-med-form { font-size: 0.8rem; color: #888; }
+    .bmp-med-reason { font-size: 0.8rem; color: #007bff; font-style: italic; }
+    .bmp-dosage { display: flex; gap: 0.3rem; align-items: center; }
+    .bmp-dose { background: #f5f7fa; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.8rem; text-align: center; min-width: 2rem; }
+    .bmp-dose.active { background: #007bff; color: white; }
+    .bmp-dose-label { font-size: 0.6rem; color: #999; display: block; }
     @keyframes slideIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
   </style>
 </head>
@@ -163,15 +180,98 @@
         isFirstScan = false;
       }
 
-      const card = document.createElement('div');
-      const found = msg.medicine && msg.medicine.found;
-      card.className = `scan-card ${found ? 'found' : 'not-found'}`;
-
+      const m = msg.medicine;
+      const found = m && m.found;
       const time = new Date(msg.timestamp).toLocaleTimeString();
+
+      // BMP Medication Plan — dedicated rich render
+      if (m && m.type === 'bmp') {
+        const card = document.createElement('div');
+        card.className = 'scan-card bmp';
+
+        let html = `<div class="time">${esc(time)} &middot; BMP Medikationsplan &middot; v${esc(m.bmpVersion || '?')}</div>`;
+        html += `<div class="medicine-name">${esc(m.name || 'Medikationsplan')}</div>`;
+
+        // Patient info
+        if (m.patient && Object.keys(m.patient).length > 0) {
+          const p = m.patient;
+          html += `<div class="bmp-patient">`;
+          html += `<span class="label">Patient</span> `;
+          html += `<span class="value">${esc([p.title, p.givenName, p.familyName].filter(Boolean).join(' '))}</span>`;
+          if (p.birthDate) html += ` <span style="color:#888">(${esc(p.birthDate)})</span>`;
+          html += `</div>`;
+        }
+
+        // Author/physician
+        if (m.author && m.author.name) {
+          html += `<div style="font-size:0.8rem;color:#888;margin:0.3rem 0">Arzt: ${esc(m.author.name)}`;
+          if (m.author.date) html += ` &middot; ${esc(m.author.date)}`;
+          html += `</div>`;
+        }
+
+        // Medication sections
+        if (m.sections && m.sections.length > 0) {
+          for (const section of m.sections) {
+            html += `<div class="bmp-section">`;
+            if (section.title) {
+              html += `<div class="bmp-section-title">${esc(section.title)}</div>`;
+            }
+            for (const med of (section.medications || [])) {
+              html += `<div class="bmp-med">`;
+              html += `<div>`;
+              html += `<div class="bmp-med-name">${esc(med.name || 'Unknown')}</div>`;
+              if (med.form || med.formText) {
+                html += `<div class="bmp-med-form">${esc(med.formText || med.form || '')}</div>`;
+              }
+              if (med.reason) {
+                html += `<div class="bmp-med-reason">${esc(med.reason)}</div>`;
+              }
+              if (med.instructions) {
+                html += `<div style="font-size:0.8rem;color:#666">${esc(med.instructions)}</div>`;
+              }
+              html += `</div>`;
+              // Dosage grid: morning / midday / evening / night
+              html += `<div class="bmp-dosage">`;
+              const doses = [
+                ['Mo', med.dosageMorning],
+                ['Mi', med.dosageMidday],
+                ['Ab', med.dosageEvening],
+                ['Na', med.dosageNight],
+              ];
+              for (const [label, val] of doses) {
+                const active = val && val !== '0';
+                html += `<div class="bmp-dose${active ? ' active' : ''}">`;
+                html += `<span class="bmp-dose-label">${esc(label)}</span>`;
+                html += esc(val || '-');
+                html += `</div>`;
+              }
+              html += `</div>`;
+              html += `</div>`;
+            }
+            html += `</div>`;
+          }
+        }
+
+        // Observations
+        if (m.observations && m.observations.length > 0) {
+          html += `<div class="bmp-section"><div class="bmp-section-title">Klinische Parameter</div>`;
+          for (const obs of m.observations) {
+            html += `<div style="font-size:0.85rem">${esc(obs.parameter || '')}: ${esc(obs.value || '')} ${esc(obs.unit || '')}</div>`;
+          }
+          html += `</div>`;
+        }
+
+        card.innerHTML = html;
+        resultsEl.prepend(card);
+        return;
+      }
+
+      // Standard barcode render (GS1, NDC, etc.)
+      const card = document.createElement('div');
+      card.className = `scan-card ${found ? 'found' : 'not-found'}`;
 
       let detailsHtml = '';
       if (found) {
-        const m = msg.medicine;
         const fields = [
           m.manufacturer && ['Manufacturer', m.manufacturer],
           m.ndc && ['NDC', m.ndc],
@@ -190,10 +290,10 @@
 
       card.innerHTML = `
         <div class="time">${esc(time)} &middot; ${esc(msg.format || 'unknown format')}</div>
-        <div class="medicine-name">${found ? esc(msg.medicine.name || 'GS1 Medicine Data') : 'Unknown Barcode'}</div>
-        <div class="barcode-raw">${esc(msg.barcode)}</div>
+        <div class="medicine-name">${found ? esc(m.name || 'GS1 Medicine Data') : 'Unknown Barcode'}</div>
+        <div class="barcode-raw">${esc(msg.barcode.length > 100 ? msg.barcode.slice(0, 100) + '...' : msg.barcode)}</div>
         ${detailsHtml}
-        ${!found ? `<p style="color:#888;font-size:0.85rem;margin-top:0.5rem">${esc(msg.medicine.message || '')}</p>` : ''}
+        ${!found ? `<p style="color:#888;font-size:0.85rem;margin-top:0.5rem">${esc(m.message || '')}</p>` : ''}
       `;
 
       resultsEl.prepend(card);

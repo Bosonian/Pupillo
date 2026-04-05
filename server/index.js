@@ -5,10 +5,12 @@ const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
 const path = require('path');
 const { processForDecode, assessQuality } = require('./image-decode');
+const { isBMP, parseBMP } = require('./bmp-parser');
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, maxPayload: 1024 }); // 1KB max for WS scan messages
+// BMP barcodes can be up to ~7KB (3x Data Matrix structured append)
+const wss = new WebSocketServer({ server, maxPayload: 16 * 1024 });
 
 // Parse large JSON bodies (base64 images) — only for the decode endpoint
 const jsonParser = express.json({ limit: '10mb' });
@@ -321,7 +323,9 @@ function safeSend(ws, data, doClose = false) {
 
 function sanitizeBarcode(barcode) {
   if (typeof barcode !== 'string') return null;
-  if (barcode.length === 0 || barcode.length > 256) return null;
+  // BMP barcodes can be up to ~7KB; regular barcodes max 256
+  const maxLen = isBMP(barcode) ? 8192 : 256;
+  if (barcode.length === 0 || barcode.length > maxLen) return null;
   return barcode;
 }
 
@@ -344,6 +348,11 @@ function sanitizeFormat(format) {
 // ═══════════════════════════════════════════════════════════════
 
 function lookupMedicine(barcode) {
+  // Check for BMP (German Medication Plan) first — this is the primary use case
+  if (isBMP(barcode)) {
+    return parseBMP(barcode);
+  }
+
   const db = {
     '0363024601': { name: 'Ibuprofen 200mg', manufacturer: 'Walgreens', ndc: '0363-0246-01', form: 'Tablet', strength: '200mg' },
     '3614273547': { name: 'Amoxicillin 500mg', manufacturer: 'Generic Pharma', ndc: '3614-2735-47', form: 'Capsule', strength: '500mg' },
