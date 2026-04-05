@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="referrer" content="no-referrer">
   <title>Pupillo — Desktop Medicine Scanner</title>
-  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+  <!-- QR code is generated server-side, no external JS needed -->
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f7fa; color: #1a1a2e; min-height: 100vh; }
@@ -62,7 +62,7 @@
   <div class="container">
     <div class="pairing-panel">
       <h2>Scan with your phone</h2>
-      <canvas id="qrCanvas"></canvas>
+      <img id="qrImage" alt="QR Code" style="max-width:250px;width:100%" />
       <p id="pairingInfo">Point your phone camera at this QR code to start scanning medicine barcodes</p>
     </div>
 
@@ -103,27 +103,18 @@
       sessionId = data.sessionId;
       sessionToken = data.token;
 
-      // Generate the phone URL (includes token for auth)
+      // Show QR code (generated server-side — no external JS needed)
+      const qrImg = document.getElementById('qrImage');
+      qrImg.src = `/api/qr/${sessionId}/${sessionToken}`;
+      qrImg.onerror = () => {
+        document.getElementById('pairingInfo').textContent = 'QR generation failed. Reload to try again.';
+      };
+
       const host = window.location.host;
       const protocol = window.location.protocol;
       const phoneUrl = `${protocol}//${host}/phone/?session=${sessionId}&token=${sessionToken}`;
-
-      // Render QR code
-      QRCode.toCanvas(document.getElementById('qrCanvas'), phoneUrl, {
-        width: 250,
-        margin: 2,
-        color: { dark: '#1a1a2e', light: '#ffffff' }
-      }, (err) => {
-        if (err) {
-          // QR library failed — show URL as text fallback
-          document.getElementById('pairingInfo').innerHTML =
-            'QR render failed. Open this URL on your phone:<br><code style="word-break:break-all;font-size:0.75rem">' + esc(phoneUrl) + '</code>';
-        }
-      });
-
-      // Also show the URL below the QR code for manual entry
       document.getElementById('pairingInfo').innerHTML =
-        'Point your phone camera at this QR code<br><small style="color:#aaa;word-break:break-all">' + esc(phoneUrl) + '</small>';
+        'Scan with phone camera or open:<br><small style="color:#aaa;word-break:break-all">' + esc(phoneUrl) + '</small>';
 
       connectWebSocket();
       } catch (err) {

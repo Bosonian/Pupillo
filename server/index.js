@@ -4,6 +4,7 @@ const { WebSocketServer } = require('ws');
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
 const path = require('path');
+const QRCode = require('qrcode');
 const { processForDecode, assessQuality } = require('./image-decode');
 const { isBMP, parseBMP } = require('./bmp-parser');
 
@@ -110,6 +111,25 @@ app.post('/api/session', (req, res) => {
   });
 
   res.json({ sessionId, token });
+});
+
+// Generate QR code image for a session
+app.get('/api/qr/:sessionId/:token', async (req, res) => {
+  const { sessionId, token } = req.params;
+  const protocol = req.get('x-forwarded-proto') || req.protocol;
+  const host = req.get('host');
+  const phoneUrl = `${protocol}://${host}/phone/?session=${sessionId}&token=${token}`;
+
+  try {
+    const png = await QRCode.toBuffer(phoneUrl, {
+      width: 300,
+      margin: 2,
+      color: { dark: '#1a1a2e', light: '#ffffff' },
+    });
+    res.type('image/png').send(png);
+  } catch (err) {
+    res.status(500).json({ error: 'QR generation failed' });
+  }
 });
 
 // Lookup medicine data from barcode
