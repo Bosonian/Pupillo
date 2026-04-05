@@ -478,8 +478,9 @@ function formatGS1Date(yymmdd) {
 // ═══════════════════════════════════════════════════════════════
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Pupillo server running on http://localhost:${PORT}`);
+const HOST = '0.0.0.0'; // Bind to all interfaces (required by Render/Docker)
+server.listen(PORT, HOST, () => {
+  console.log(`Pupillo server running on http://${HOST}:${PORT}`);
   console.log(`Desktop view: http://localhost:${PORT}/desktop/`);
   console.log(`Phone scanner: connect via QR code from desktop`);
 });

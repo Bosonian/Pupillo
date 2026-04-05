@@ -7,11 +7,16 @@
     "start": "node server/index.js",
     "dev": "node server/index.js"
   },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
-    "bwip-js": "^4.5.1",
     "express": "^4.18.2",
     "sharp": "^0.33.2",
     "uuid": "^9.0.0",
     "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "bwip-js": "^4.5.1"
   }
 }
