@@ -1,20 +1,16 @@
 /**
  * Server-side barcode image processing pipeline.
  *
- * When the client-side ZXing decoder fails (bad angle, poor lighting, small code),
- * the phone sends a high-res still frame to the server. The server applies multiple
- * image preprocessing strategies and attempts to decode with each one.
+ * Optimized for large Data Matrix ECC 200 symbols (like BMP medication plans)
+ * which are ~100-144 modules and contain internal data region subdivisions
+ * that look like a grid but are a single symbol.
  */
 
 const sharp = require('sharp');
 
-const MAX_DIMENSION = 4096;   // Reject images larger than this
-const MAX_UPSCALE_DIM = 2048; // Cap upscaled variants
+const MAX_DIMENSION = 4096;
+const MAX_UPSCALE_DIM = 3000; // Higher for large Data Matrix
 
-/**
- * Validate and normalize input image. Rejects oversized/corrupt images.
- * Returns { buffer, width, height } or throws.
- */
 async function validateAndNormalize(imageBuffer) {
   const metadata = await sharp(imageBuffer).metadata();
   const { width, height, format } = metadata;
@@ -22,7 +18,6 @@ async function validateAndNormalize(imageBuffer) {
   if (!width || !height) throw new Error('Cannot read image dimensions');
   if (!['jpeg', 'png', 'webp'].includes(format)) throw new Error(`Unsupported format: ${format}`);
 
-  // Downscale if too large
   if (width > MAX_DIMENSION || height > MAX_DIMENSION) {
     const resized = await sharp(imageBuffer)
       .resize(MAX_DIMENSION, MAX_DIMENSION, { fit: 'inside', withoutEnlargement: true })
@@ -34,75 +29,119 @@ async function validateAndNormalize(imageBuffer) {
 }
 
 /**
- * Preprocessing pipeline — generates multiple enhanced versions of the input image.
- * Each variant targets a different failure mode.
+ * Generate preprocessing variants. Ordered from most to least likely to help
+ * with large dense Data Matrix barcodes captured from phone cameras.
  */
 async function generateVariants(imageBuffer) {
   const { buffer, width, height } = await validateAndNormalize(imageBuffer);
   const variants = [];
 
-  // Variant 1: Sharpen + contrast boost (blurry/out-of-focus)
+  // === Priority variants for large Data Matrix (BMP) ===
+
+  // V1: Grayscale + normalize + sharpen — best general-purpose for clean captures
   variants.push({
-    name: 'sharpen-contrast',
-    buffer: await sharp(buffer)
-      .sharpen({ sigma: 2, m1: 1.5, m2: 0.7 })
-      .modulate({ brightness: 1.1 })
-      .linear(1.5, -(128 * 0.5))
-      .grayscale()
-      .toBuffer()
+    name: 'normalize-sharpen',
+    buffer: await sharp(buffer).grayscale().normalize().sharpen({ sigma: 2 }).toBuffer()
   });
 
-  // Variant 2: Hard threshold (poor/uneven lighting)
-  variants.push({
-    name: 'threshold',
-    buffer: await sharp(buffer).grayscale().normalize().threshold(128).toBuffer()
-  });
-
-  // Variant 3: Normalize + sharpen (washed out / overexposed)
-  variants.push({
-    name: 'normalize',
-    buffer: await sharp(buffer).grayscale().normalize().sharpen({ sigma: 1.5 }).toBuffer()
-  });
-
-  // Variant 4: Invert (codes on dark backgrounds)
-  variants.push({
-    name: 'invert',
-    buffer: await sharp(buffer).grayscale().negate().normalize().threshold(128).toBuffer()
-  });
-
-  // Variant 5: Center crop + upscale (small code far from camera)
+  // V2: Center crop (60%) + upscale — user likely centered the barcode
+  // Critical for large DM: need enough pixels per module
   if (width > 400 && height > 400) {
-    const cropW = Math.round(width * 0.4);
-    const cropH = Math.round(height * 0.4);
+    const cropW = Math.round(width * 0.6);
+    const cropH = Math.round(height * 0.6);
     const left = Math.round((width - cropW) / 2);
     const top = Math.round((height - cropH) / 2);
-    // Cap upscale to prevent memory blowup
     const scale = Math.min(3, MAX_UPSCALE_DIM / Math.max(cropW, cropH));
-    const targetW = Math.round(cropW * scale);
-    const targetH = Math.round(cropH * scale);
     variants.push({
-      name: 'center-crop-upscale',
+      name: 'center-crop-60',
       buffer: await sharp(buffer)
         .extract({ left, top, width: cropW, height: cropH })
-        .resize(targetW, targetH, { kernel: 'lanczos3' })
+        .resize(Math.round(cropW * scale), Math.round(cropH * scale), { kernel: 'lanczos3' })
         .grayscale().normalize().sharpen({ sigma: 1.5 })
         .toBuffer()
     });
   }
 
-  // Variant 6: Low threshold (faint/low-contrast codes)
+  // V3: Tighter center crop (40%) + higher upscale — barcode fills more of frame
+  if (width > 400 && height > 400) {
+    const cropW = Math.round(width * 0.4);
+    const cropH = Math.round(height * 0.4);
+    const left = Math.round((width - cropW) / 2);
+    const top = Math.round((height - cropH) / 2);
+    const scale = Math.min(4, MAX_UPSCALE_DIM / Math.max(cropW, cropH));
+    variants.push({
+      name: 'center-crop-40',
+      buffer: await sharp(buffer)
+        .extract({ left, top, width: cropW, height: cropH })
+        .resize(Math.round(cropW * scale), Math.round(cropH * scale), { kernel: 'lanczos3' })
+        .grayscale().normalize().sharpen({ sigma: 2 })
+        .toBuffer()
+    });
+  }
+
+  // V4: Global threshold at 128 — standard binarization
   variants.push({
-    name: 'low-threshold',
+    name: 'threshold-128',
+    buffer: await sharp(buffer).grayscale().normalize().threshold(128).toBuffer()
+  });
+
+  // V5: Sharpen aggressively + contrast boost — for blurry captures
+  variants.push({
+    name: 'sharpen-heavy',
+    buffer: await sharp(buffer)
+      .sharpen({ sigma: 3, m1: 2, m2: 1 })
+      .linear(1.8, -(128 * 0.8)) // heavy contrast
+      .grayscale()
+      .toBuffer()
+  });
+
+  // V6: Median filter (denoise) + threshold — for noisy phone cameras
+  variants.push({
+    name: 'denoise-threshold',
+    buffer: await sharp(buffer)
+      .grayscale()
+      .median(3) // 3x3 median filter removes salt-and-pepper noise
+      .normalize()
+      .threshold(128)
+      .toBuffer()
+  });
+
+  // V7: Low threshold — for faded/light printed barcodes
+  variants.push({
+    name: 'threshold-90',
     buffer: await sharp(buffer).grayscale().normalize().threshold(90).toBuffer()
   });
 
-  // Variant 7: High threshold (noisy images)
+  // V8: High threshold — for noisy/dirty paper
   variants.push({
-    name: 'high-threshold',
+    name: 'threshold-170',
     buffer: await sharp(buffer).grayscale().normalize().threshold(170).toBuffer()
   });
 
-  // Rotated variants
+  // V9: Center crop + threshold — combined
+  if (width > 400 && height > 400) {
+    const cropW = Math.round(width * 0.5);
+    const cropH = Math.round(height * 0.5);
+    const left = Math.round((width - cropW) / 2);
+    const top = Math.round((height - cropH) / 2);
+    const scale = Math.min(3, MAX_UPSCALE_DIM / Math.max(cropW, cropH));
+    variants.push({
+      name: 'crop-threshold',
+      buffer: await sharp(buffer)
+        .extract({ left, top, width: cropW, height: cropH })
+        .resize(Math.round(cropW * scale), Math.round(cropH * scale), { kernel: 'lanczos3' })
+        .grayscale().normalize().threshold(128)
+        .toBuffer()
+    });
+  }
+
+  // V10: Invert (dark backgrounds)
+  variants.push({
+    name: 'invert',
+    buffer: await sharp(buffer).grayscale().negate().normalize().threshold(128).toBuffer()
+  });
+
+  // V11-13: Rotations (in case phone orientation metadata is wrong)
   for (const angle of [90, 180, 270]) {
     variants.push({
       name: `rotate-${angle}`,
@@ -129,10 +168,6 @@ async function processForDecode(imageBuffer) {
   return results;
 }
 
-/**
- * Quick quality assessment of a frame.
- * Returns a score 0-100 estimating how decodable the image likely is.
- */
 async function assessQuality(imageBuffer) {
   const { buffer, width, height } = await validateAndNormalize(imageBuffer);
 
@@ -145,7 +180,6 @@ async function assessQuality(imageBuffer) {
   const w = gray.info.width;
   const h = gray.info.height;
 
-  // Laplacian variance on center region
   let sum = 0;
   let sumSq = 0;
   let count = 0;
@@ -164,7 +198,6 @@ async function assessQuality(imageBuffer) {
     }
   }
 
-  // Guard against division by zero (tiny images)
   if (count === 0) {
     return { sharpness: 0, resolution: 0, overall: 0, width, height };
   }

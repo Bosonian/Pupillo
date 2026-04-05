@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
   <meta name="referrer" content="no-referrer">
   <title>Pupillo — Scan Medicine</title>
-  <!-- zxing-wasm: C++ zxing compiled to WASM — supports Data Matrix structured append -->
+  <!-- zxing-wasm: C++ zxing compiled to WASM — handles large Data Matrix ECC 200 -->
   <script src="https://cdn.jsdelivr.net/npm/zxing-wasm@3.0.2/dist/iife/reader/index.js"
     onerror="document.body.innerHTML='<div style=\'color:#ff6b6b;padding:2rem;text-align:center\'><h2>Failed to load scanner</h2><p>Check network and reload.</p></div>'"></script>
   <style>
@@ -43,9 +43,9 @@
     .last-scan .barcode { font-family: monospace; font-size: 0.8rem; color: #aaa; margin-top: 0.2rem; }
     .last-scan .info { font-size: 0.85rem; color: #ccc; margin-top: 0.2rem; }
     .error { color: #ff6b6b; padding: 2rem; text-align: center; }
-    .manual-btn { position: absolute; bottom: 4.5rem; left: 50%; transform: translateX(-50%); background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.3); color: white; padding: 0.6rem 1.5rem; border-radius: 25px; font-size: 0.9rem; cursor: pointer; backdrop-filter: blur(10px); }
-    .manual-btn:active { background: rgba(255,255,255,0.3); }
-    .manual-btn.processing { opacity: 0.5; pointer-events: none; }
+    .capture-btn { position: absolute; bottom: 4.5rem; left: 50%; transform: translateX(-50%); background: rgba(0,123,255,0.7); border: 2px solid rgba(255,255,255,0.5); color: white; padding: 0.9rem 2rem; border-radius: 30px; font-size: 1rem; font-weight: 600; cursor: pointer; backdrop-filter: blur(10px); letter-spacing: 0.5px; }
+    .capture-btn:active { background: rgba(0,123,255,0.9); transform: translateX(-50%) scale(0.96); }
+    .capture-btn.processing { opacity: 0.5; pointer-events: none; }
     @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
     canvas { display: none; }
   </style>
@@ -67,7 +67,7 @@
     <div class="scan-count" id="scanCount">0 scans</div>
     <div class="mode-indicator" id="modeIndicator">Live scan</div>
     <div class="guidance" id="guidance">Initializing scanner...</div>
-    <button class="manual-btn" id="manualBtn">Tap to capture &amp; enhance</button>
+    <button class="capture-btn" id="captureBtn">FOTO AUFNEHMEN &amp; ERKENNEN</button>
   </div>
 
   <div class="last-scan" id="lastScan">
@@ -90,13 +90,12 @@
     // ═══════════════════════════════════════════════════════════════
     // CONFIGURATION
     // ═══════════════════════════════════════════════════════════════
-    const SCAN_INTERVAL_MS = 200;           // ~5 FPS decode rate
+    const SCAN_INTERVAL_MS = 250;           // ~4 FPS decode rate
     const DEBOUNCE_MS = 2000;
-    const SERVER_DECODE_INTERVAL = 3000;
-    const FAILED_FRAMES_BEFORE_SERVER = 15;
+    const SERVER_DECODE_INTERVAL = 4000;
+    const FAILED_FRAMES_BEFORE_SERVER = 12;
     const FOCUS_CYCLE_MS = 4000;
     const MAX_RECONNECT_ATTEMPTS = 10;
-    const STRUCTURED_APPEND_TIMEOUT = 10000; // 10s to collect all parts
 
     // ═══════════════════════════════════════════════════════════════
     // DOM
@@ -107,7 +106,7 @@
     const scanCountEl = document.getElementById('scanCount');
     const modeEl = document.getElementById('modeIndicator');
     const guidanceEl = document.getElementById('guidance');
-    const manualBtn = document.getElementById('manualBtn');
+    const captureBtn = document.getElementById('captureBtn');
     const videoEl = document.getElementById('video');
     const captureCanvas = document.getElementById('captureCanvas');
 
@@ -131,11 +130,7 @@
     let failureMonitorId = null;
     let scanLoopId = null;
 
-    // Structured append reassembly buffer
-    // Key: sequenceId → { parts: Map<index, Uint8Array>, total: number, startTime: number }
-    const appendBuffer = new Map();
-
-    // zxing-wasm reader options
+    // zxing-wasm reader options — optimized for large Data Matrix (BMP)
     const readerOptions = {
       formats: ['DataMatrix', 'QRCode', 'EAN13', 'EAN8', 'Code128', 'Code39',
                 'UPCA', 'UPCE', 'PDF417', 'Aztec', 'Codabar', 'ITF',
@@ -144,7 +139,18 @@
       tryRotate: true,
       tryInvert: true,
       tryDownscale: true,
-      maxNumberOfSymbols: 6, // Scan up to 6 symbols per frame (for structured append)
+      maxNumberOfSymbols: 4,
+    };
+
+    // More aggressive options for high-res still capture
+    const hiResReaderOptions = {
+      formats: ['DataMatrix'],  // Focus only on Data Matrix for BMP
+      tryHarder: true,
+      tryRotate: true,
+      tryInvert: true,
+      tryDownscale: true,
+      tryDenoise: true,
+      maxNumberOfSymbols: 1,
     };
 
     if (!sessionId || !sessionToken) {
@@ -169,7 +175,7 @@
       await startCamera();
       startScanLoop();
       startFailureMonitor();
-      manualBtn.addEventListener('click', () => serverSideDecode('manual'));
+      captureBtn.addEventListener('click', () => captureAndDecode());
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -177,11 +183,13 @@
     // ═══════════════════════════════════════════════════════════════
     async function startCamera() {
       try {
+        // Request highest resolution available — large Data Matrix needs
+        // enough pixels per module (each module ~0.5mm at 300dpi print)
         const constraints = {
           video: {
             facingMode: { ideal: 'environment' },
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
+            width: { ideal: 3840 },
+            height: { ideal: 2160 },
           }
         };
 
@@ -268,83 +276,19 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // STRUCTURED APPEND REASSEMBLY
-    //
-    // BMP barcodes use Data Matrix structured append: multiple symbols
-    // that need to be collected and concatenated in order.
-    // zxing-wasm exposes: sequenceSize, sequenceIndex, sequenceId
+    // RESULT PROCESSING
+    // BMP is a SINGLE large Data Matrix ECC 200 symbol (not structured
+    // append). The internal grid pattern is data region subdivision
+    // per ISO/IEC 16022, not separate symbols.
     // ═══════════════════════════════════════════════════════════════
     function processResults(results) {
       for (const result of results) {
         if (!result.isValid) continue;
 
-        const { sequenceSize, sequenceIndex, sequenceId } = result;
-
-        // Non-structured-append barcode (single symbol)
-        if (sequenceSize <= 0) {
-          failedFrameCount = 0;
-          // For binary content (like BMP), use raw bytes converted to latin1
-          const barcode = bytesToLatin1(result.bytes);
-          handleScan(barcode, result.format, 'live');
-          continue;
-        }
-
-        // Structured append symbol — add to reassembly buffer
-        const key = sequenceId || 'default';
-        if (!appendBuffer.has(key)) {
-          appendBuffer.set(key, {
-            parts: new Map(),
-            total: sequenceSize,
-            startTime: Date.now(),
-          });
-        }
-
-        const buf = appendBuffer.get(key);
-        buf.parts.set(sequenceIndex, new Uint8Array(result.bytes));
-
-        // Update UI with progress
-        const collected = buf.parts.size;
-        overlayEl.classList.add('partial');
-        setGuidance(`Scanning multi-part barcode: ${collected}/${buf.total}`, false, true);
-
-        // Check if we have all parts
-        if (collected >= buf.total) {
-          // Reassemble in order
-          const ordered = [];
-          for (let i = 0; i < buf.total; i++) {
-            const part = buf.parts.get(i);
-            if (!part) {
-              setGuidance(`Missing part ${i + 1} — keep scanning`, true);
-              return; // Missing a part — keep trying
-            }
-            ordered.push(part);
-          }
-
-          // Concatenate all parts
-          const totalLen = ordered.reduce((s, p) => s + p.length, 0);
-          const combined = new Uint8Array(totalLen);
-          let offset = 0;
-          for (const part of ordered) {
-            combined.set(part, offset);
-            offset += part.length;
-          }
-
-          appendBuffer.delete(key);
-          overlayEl.classList.remove('partial');
-
-          failedFrameCount = 0;
-          const barcode = bytesToLatin1(combined);
-          handleScan(barcode, 'DataMatrix', `live:structured-append(${buf.total})`);
-        }
-      }
-
-      // Clean up stale append buffers
-      const now = Date.now();
-      for (const [key, buf] of appendBuffer) {
-        if (now - buf.startTime > STRUCTURED_APPEND_TIMEOUT) {
-          appendBuffer.delete(key);
-          overlayEl.classList.remove('partial');
-        }
+        failedFrameCount = 0;
+        // Use raw bytes for binary content (BMP = "MP" + zlib)
+        const barcode = bytesToLatin1(result.bytes);
+        handleScan(barcode, result.format, 'live');
       }
     }
 
@@ -363,80 +307,114 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // SERVER-SIDE ENHANCED DECODE
+    // CAPTURE & DECODE — Two-stage pipeline:
+    // Stage 1: High-res client-side decode (ImageCapture API → zxing-wasm)
+    // Stage 2: Server-side preprocessing if client fails
+    //
+    // For large Data Matrix (BMP ~100+ modules), high-res stills
+    // are essential — live video frames rarely have enough resolution.
     // ═══════════════════════════════════════════════════════════════
-    async function serverSideDecode(trigger) {
+    async function captureAndDecode() {
       if (isServerDecoding) return;
       isServerDecoding = true;
 
       overlayEl.classList.add('processing');
-      modeEl.textContent = 'Enhanced scan...';
+      modeEl.textContent = 'Capturing...';
       modeEl.classList.add('server');
-      manualBtn.classList.add('processing');
-      setGuidance('Processing — hold steady...', true);
+      captureBtn.classList.add('processing');
+      if (navigator.vibrate) navigator.vibrate(50);
 
       try {
-        const frameData = await captureHighResFrame();
-        if (!frameData) { setGuidance('Capture failed — try again'); return; }
+        // === Stage 1: Client-side high-res decode ===
+        setGuidance('Capturing high-res photo...');
 
+        const { blob, dataUrl } = await captureHighResFrame();
+        if (!blob && !dataUrl) {
+          setGuidance('Capture failed — try again', true);
+          return;
+        }
+
+        // Try decoding the raw high-res capture directly
+        setGuidance('Decoding...');
+        try {
+          const input = blob || await (await fetch(dataUrl)).blob();
+          const results = await ZXingWASM.readBarcodes(input, hiResReaderOptions);
+          if (results.length > 0 && results[0].isValid) {
+            const r = results[0];
+            handleScan(bytesToLatin1(r.bytes), r.format, 'hires-capture');
+            setGuidance('Decoded from high-res capture');
+            return;
+          }
+        } catch { /* client decode failed, continue to server */ }
+
+        // === Stage 2: Server-side preprocessing + client decode ===
+        setGuidance('Enhancing image on server...');
+
+        const imageData = dataUrl || await blobToDataUrl(blob);
         const response = await fetch('/api/decode-image', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ image: frameData })
+          body: JSON.stringify({ image: imageData })
         });
 
         if (!response.ok) throw new Error('Server error');
         const { quality, variants } = await response.json();
 
         if (quality.sharpness < 20) {
-          setGuidance('Image is blurry — hold phone steadier', true);
-        } else if (quality.sharpness < 40) {
-          setGuidance('Trying enhanced decode...', true);
+          setGuidance('Image blurry — hold steadier, try again', true);
         }
 
-        // Try to decode each server-preprocessed variant with zxing-wasm
+        // Try each server-preprocessed variant
         for (const variant of variants) {
           try {
-            // Convert base64 data URL to blob for zxing-wasm
             const resp = await fetch(variant.dataUrl);
-            const blob = await resp.blob();
-            const results = await ZXingWASM.readBarcodes(blob, readerOptions);
+            const variantBlob = await resp.blob();
+            const results = await ZXingWASM.readBarcodes(variantBlob, hiResReaderOptions);
 
             if (results.length > 0 && results[0].isValid) {
               const r = results[0];
-              const barcode = bytesToLatin1(r.bytes);
-              handleScan(barcode, r.format, `server:${variant.name}`);
-              setGuidance(`Decoded via ${variant.name}`);
+              handleScan(bytesToLatin1(r.bytes), r.format, `server:${variant.name}`);
+              setGuidance(`Decoded (${variant.name})`);
               return;
             }
-          } catch { /* try next variant */ }
+          } catch { /* try next */ }
         }
 
-        setGuidance('Could not decode — move closer or improve lighting', true);
+        setGuidance('Not decoded — try: closer, flat, good light', true);
       } catch (err) {
-        console.error('Server decode error:', err);
-        setGuidance('Processing error — try again');
+        console.error('Capture decode error:', err);
+        setGuidance('Error — try again', true);
       } finally {
         isServerDecoding = false;
         overlayEl.classList.remove('processing');
         modeEl.textContent = 'Live scan';
         modeEl.classList.remove('server');
-        manualBtn.classList.remove('processing');
+        captureBtn.classList.remove('processing');
       }
     }
 
+    /**
+     * Capture highest resolution still frame possible.
+     * Returns { blob, dataUrl } — one or both may be set.
+     */
     async function captureHighResFrame() {
+      // Method 1: ImageCapture API — takes a real photo at full sensor resolution
       if (imageCapture) {
         try {
-          const blob = await imageCapture.takePhoto({ imageWidth: 3264, imageHeight: 2448 });
-          return await blobToDataUrl(blob);
-        } catch (e) { /* fall through */ }
+          const blob = await imageCapture.takePhoto({
+            imageWidth: 4032,   // Request maximum resolution
+            imageHeight: 3024,
+          });
+          return { blob, dataUrl: null };
+        } catch (e) { /* fall through to canvas */ }
       }
-      if (!videoEl.videoWidth) return null;
+
+      // Method 2: Canvas grab from video (lower res but always works)
+      if (!videoEl.videoWidth) return { blob: null, dataUrl: null };
       captureCanvas.width = videoEl.videoWidth;
       captureCanvas.height = videoEl.videoHeight;
       captureCanvas.getContext('2d').drawImage(videoEl, 0, 0);
-      return captureCanvas.toDataURL('image/jpeg', 0.95);
+      return { blob: null, dataUrl: captureCanvas.toDataURL('image/jpeg', 0.95) };
     }
 
     function blobToDataUrl(blob) {
@@ -458,7 +436,7 @@
         if (isServerDecoding) return;
 
         failedFrameCount = 0;
-        await serverSideDecode('auto');
+        await captureAndDecode();
       }, SERVER_DECODE_INTERVAL);
     }
 
