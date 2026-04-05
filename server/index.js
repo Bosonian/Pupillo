@@ -142,7 +142,7 @@ app.get('/api/medicine/:barcode', (req, res) => {
 // Server-side image processing for hard-to-decode barcodes
 // Concurrency limiter: only N simultaneous image decode operations
 let activeImageDecodes = 0;
-const MAX_CONCURRENT_DECODES = 3;
+const MAX_CONCURRENT_DECODES = 2; // Reduced for Render free tier
 
 app.post('/api/decode-image', jsonParser, async (req, res) => {
   // Rate limit: max 10 image decodes per minute per IP
