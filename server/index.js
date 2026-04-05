@@ -29,6 +29,9 @@ app.use((_req, res, next) => {
 // Serve static files
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
+// Redirect root to desktop view
+app.get('/', (_req, res) => res.redirect('/desktop/'));
+
 // ═══════════════════════════════════════════════════════════════
 // SESSION MANAGEMENT
 // ═══════════════════════════════════════════════════════════════
