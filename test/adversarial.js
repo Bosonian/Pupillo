@@ -117,6 +117,17 @@ const DEGRADATIONS = {
     return addNoise(degraded, 20);
   },
 
+  // Moiré pattern (photographing a screen/monitor)
+  // Simulate by overlaying a high-frequency grid pattern
+  'moire-light': async (buf) => addMoire(buf, 3, 30),
+  'moire-heavy': async (buf) => addMoire(buf, 2, 60),
+
+  // Screen capture (monitor photo: moiré + slight blur + brightness)
+  'screen-capture': async (buf) => {
+    let degraded = await addMoire(buf, 3, 25);
+    return sharp(degraded).blur(0.8).modulate({ brightness: 1.1 }).jpeg({ quality: 80 }).toBuffer();
+  },
+
   // Perspective distortion (simulated by affine transform via crop)
   'perspective-mild': async (buf) => {
     const meta = await sharp(buf).metadata();
@@ -139,6 +150,26 @@ const DEGRADATIONS = {
       .toBuffer();
   },
 };
+
+/**
+ * Add moiré pattern to simulate photographing a screen.
+ * Overlays a periodic grid at the given frequency.
+ */
+async function addMoire(buf, frequency, intensity) {
+  const { data, info } = await sharp(buf).raw().toBuffer({ resolveWithObject: true });
+  const pixels = Buffer.from(data);
+  const { width, height, channels } = info;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const moire = Math.sin(x * frequency) * Math.sin(y * frequency) * intensity;
+      const idx = (y * width + x) * channels;
+      for (let c = 0; c < Math.min(channels, 3); c++) {
+        pixels[idx + c] = Math.max(0, Math.min(255, pixels[idx + c] + moire));
+      }
+    }
+  }
+  return sharp(pixels, { raw: { width, height, channels } }).png().toBuffer();
+}
 
 /**
  * Add salt-and-pepper noise to an image buffer.

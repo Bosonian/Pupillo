@@ -158,7 +158,36 @@ async function generateVariants(imageBuffer) {
     });
   }
 
-  // V10: Invert (dark backgrounds)
+  // V10: Anti-moiré — for photos taken of screens/monitors
+  // Moiré patterns from screen pixel grid interfere with Data Matrix modules.
+  // A slight Gaussian blur + resize breaks the moiré frequency, then
+  // re-sharpen + threshold recovers the binary pattern.
+  variants.push({
+    name: 'anti-moire',
+    buffer: await sharp(buffer)
+      .grayscale()
+      .blur(2.0)       // break moiré frequency
+      .resize(Math.round(width * 0.8), Math.round(height * 0.8)) // resample
+      .resize(width, height, { kernel: 'lanczos3' })             // scale back
+      .normalize()
+      .threshold(128)
+      .toBuffer()
+  });
+
+  // V10b: Anti-moiré + median (stronger variant for heavy moiré)
+  variants.push({
+    name: 'anti-moire-median',
+    buffer: await sharp(buffer)
+      .grayscale()
+      .median(3)        // median filter kills periodic noise
+      .blur(1.5)
+      .normalize()
+      .sharpen({ sigma: 2 })
+      .threshold(128)
+      .toBuffer()
+  });
+
+  // V11: Invert (dark backgrounds)
   variants.push({
     name: 'invert',
     buffer: await sharp(buffer).grayscale().negate().normalize().threshold(128).toBuffer()
