@@ -3,10 +3,14 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
+const { processForDecode, assessQuality } = require('./image-decode');
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ server, maxPayload: 10 * 1024 * 1024 }); // 10MB for image frames
+
+// Parse large JSON bodies (base64 images)
+app.use(express.json({ limit: '10mb' }));
 
 // Serve static files
 app.use(express.static(path.join(__dirname, '..', 'public')));
@@ -34,6 +38,31 @@ app.post('/api/session', (_req, res) => {
 app.get('/api/medicine/:barcode', (req, res) => {
   const data = lookupMedicine(req.params.barcode);
   res.json(data);
+});
+
+// REST endpoint: server-side image processing for hard-to-decode barcodes
+// Phone sends a high-res still frame; server applies multiple preprocessing
+// strategies and returns enhanced images for client-side decode retry.
+app.post('/api/decode-image', async (req, res) => {
+  try {
+    const { image } = req.body; // base64 data URL
+    if (!image) return res.status(400).json({ error: 'No image provided' });
+
+    // Strip data URL prefix
+    const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
+    const imageBuffer = Buffer.from(base64Data, 'base64');
+
+    // Assess image quality first
+    const quality = await assessQuality(imageBuffer);
+
+    // Generate preprocessed variants
+    const variants = await processForDecode(imageBuffer);
+
+    res.json({ quality, variants });
+  } catch (err) {
+    console.error('Image decode error:', err);
+    res.status(500).json({ error: 'Image processing failed' });
+  }
 });
 
 // WebSocket handling

@@ -4,25 +4,45 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
   <title>Pupillo — Scan Medicine</title>
-  <!-- ZXing barcode reader library — supports 1D, 2D, DataMatrix, QR, EAN, Code128 -->
   <script src="https://unpkg.com/@AmbiqAI/zxing-browser@0.1.6/dist/zxing-browser.umd.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: white; min-height: 100vh; display: flex; flex-direction: column; }
-    .header { padding: 1rem; text-align: center; }
+    .header { padding: 0.8rem 1rem; text-align: center; }
     .header h1 { font-size: 1.2rem; }
-    .header .status { font-size: 0.85rem; color: #aaa; margin-top: 0.3rem; }
+    .header .status { font-size: 0.85rem; color: #aaa; margin-top: 0.2rem; }
     .header .status.ok { color: #28a745; }
     .camera-container { position: relative; flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; background: black; }
     #video { width: 100%; height: 100%; object-fit: cover; }
-    .scan-overlay { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 260px; height: 160px; border: 2px solid rgba(255,255,255,0.6); border-radius: 12px; pointer-events: none; }
-    .scan-overlay.scanned { border-color: #28a745; box-shadow: 0 0 20px rgba(40,167,69,0.5); }
-    .last-scan { padding: 1rem; background: #16213e; text-align: center; min-height: 80px; display: flex; flex-direction: column; justify-content: center; }
+    .scan-overlay {
+      position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      width: 240px; height: 240px;
+      border: 2px solid rgba(255,255,255,0.5); border-radius: 12px;
+      pointer-events: none; transition: all 0.2s;
+    }
+    .scan-overlay.scanned { border-color: #28a745; box-shadow: 0 0 30px rgba(40,167,69,0.6); }
+    .scan-overlay.processing { border-color: #ffc107; box-shadow: 0 0 20px rgba(255,193,7,0.4); animation: pulse 1s infinite; }
+    .scan-overlay .corners { position: absolute; inset: -2px; }
+    .scan-overlay .corner { position: absolute; width: 20px; height: 20px; border: 3px solid white; }
+    .scan-overlay .corner.tl { top: 0; left: 0; border-right: none; border-bottom: none; border-radius: 8px 0 0 0; }
+    .scan-overlay .corner.tr { top: 0; right: 0; border-left: none; border-bottom: none; border-radius: 0 8px 0 0; }
+    .scan-overlay .corner.bl { bottom: 0; left: 0; border-right: none; border-top: none; border-radius: 0 0 0 8px; }
+    .scan-overlay .corner.br { bottom: 0; right: 0; border-left: none; border-top: none; border-radius: 0 0 8px 0; }
+    .guidance { position: absolute; bottom: 0; left: 0; right: 0; text-align: center; padding: 0.8rem; background: linear-gradient(transparent, rgba(0,0,0,0.8)); font-size: 0.9rem; color: #ddd; }
+    .guidance.warn { color: #ffc107; }
+    .scan-count { position: absolute; top: 0.8rem; right: 0.8rem; background: rgba(0,0,0,0.6); padding: 0.3rem 0.8rem; border-radius: 20px; font-size: 0.85rem; }
+    .mode-indicator { position: absolute; top: 0.8rem; left: 0.8rem; background: rgba(0,0,0,0.6); padding: 0.3rem 0.8rem; border-radius: 20px; font-size: 0.75rem; }
+    .mode-indicator.server { background: rgba(255,193,7,0.3); color: #ffc107; }
+    .last-scan { padding: 1rem; background: #16213e; text-align: center; min-height: 70px; display: flex; flex-direction: column; justify-content: center; }
     .last-scan .name { font-size: 1.1rem; font-weight: 600; }
-    .last-scan .barcode { font-family: monospace; font-size: 0.8rem; color: #aaa; margin-top: 0.3rem; }
-    .last-scan .info { font-size: 0.85rem; color: #ccc; margin-top: 0.3rem; }
-    .scan-count { position: absolute; top: 1rem; right: 1rem; background: rgba(0,0,0,0.6); padding: 0.3rem 0.8rem; border-radius: 20px; font-size: 0.85rem; }
+    .last-scan .barcode { font-family: monospace; font-size: 0.8rem; color: #aaa; margin-top: 0.2rem; }
+    .last-scan .info { font-size: 0.85rem; color: #ccc; margin-top: 0.2rem; }
     .error { color: #ff6b6b; padding: 2rem; text-align: center; }
+    .manual-btn { position: absolute; bottom: 4.5rem; left: 50%; transform: translateX(-50%); background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.3); color: white; padding: 0.6rem 1.5rem; border-radius: 25px; font-size: 0.9rem; cursor: pointer; backdrop-filter: blur(10px); }
+    .manual-btn:active { background: rgba(255,255,255,0.3); }
+    .manual-btn.processing { opacity: 0.5; pointer-events: none; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
+    canvas { display: none; }
   </style>
 </head>
 <body>
@@ -33,36 +53,486 @@
 
   <div class="camera-container">
     <video id="video" autoplay playsinline muted></video>
-    <div class="scan-overlay" id="overlay"></div>
+    <div class="scan-overlay" id="overlay">
+      <div class="corners">
+        <div class="corner tl"></div><div class="corner tr"></div>
+        <div class="corner bl"></div><div class="corner br"></div>
+      </div>
+    </div>
     <div class="scan-count" id="scanCount">0 scans</div>
+    <div class="mode-indicator" id="modeIndicator">Live scan</div>
+    <div class="guidance" id="guidance">Position barcode inside the frame</div>
+    <button class="manual-btn" id="manualBtn">Tap to capture &amp; enhance</button>
   </div>
 
   <div class="last-scan" id="lastScan">
     <div class="info">Point camera at a medicine barcode</div>
   </div>
 
+  <!-- Hidden canvases for image processing -->
+  <canvas id="captureCanvas"></canvas>
+  <canvas id="processCanvas"></canvas>
+
   <script>
+    // ═══════════════════════════════════════════════════════════════
+    // CONFIGURATION
+    // ═══════════════════════════════════════════════════════════════
+    const DEBOUNCE_MS = 2000;
+    const SERVER_DECODE_INTERVAL = 3000;  // How often to try server-side (ms)
+    const FAILED_FRAMES_BEFORE_SERVER = 15; // Client failures before auto-escalating
+    const FOCUS_CYCLE_MS = 4000;           // Refocus cycle interval
+
+    // ═══════════════════════════════════════════════════════════════
+    // DOM
+    // ═══════════════════════════════════════════════════════════════
     const statusEl = document.getElementById('status');
     const lastScanEl = document.getElementById('lastScan');
     const overlayEl = document.getElementById('overlay');
     const scanCountEl = document.getElementById('scanCount');
+    const modeEl = document.getElementById('modeIndicator');
+    const guidanceEl = document.getElementById('guidance');
+    const manualBtn = document.getElementById('manualBtn');
     const videoEl = document.getElementById('video');
+    const captureCanvas = document.getElementById('captureCanvas');
+    const processCanvas = document.getElementById('processCanvas');
 
+    // ═══════════════════════════════════════════════════════════════
+    // STATE
+    // ═══════════════════════════════════════════════════════════════
     const params = new URLSearchParams(window.location.search);
     const sessionId = params.get('session');
     let ws;
     let scanCount = 0;
     let lastBarcode = '';
     let lastScanTime = 0;
-    const DEBOUNCE_MS = 2000; // Prevent duplicate scans within 2 seconds
+    let failedFrameCount = 0;
+    let isServerDecoding = false;
+    let stream = null;
+    let imageCapture = null; // ImageCapture API for high-res stills
+    let codeReader = null;
 
     if (!sessionId) {
-      document.body.innerHTML = '<div class="error"><h2>No session ID</h2><p>Please scan the QR code shown on the desktop to connect.</p></div>';
+      document.body.innerHTML = '<div class="error"><h2>No session ID</h2><p>Scan the QR code on your desktop screen.</p></div>';
     } else {
-      connectWebSocket();
-      startScanner();
+      init();
     }
 
+    async function init() {
+      connectWebSocket();
+      await startCamera();
+      startLiveDecoder();
+      startFailureMonitor();
+      manualBtn.addEventListener('click', () => serverSideDecode('manual'));
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // LAYER 0: CAMERA — get the best raw input we can
+    // ═══════════════════════════════════════════════════════════════
+    async function startCamera() {
+      try {
+        // Request high resolution + continuous autofocus
+        const constraints = {
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            // These are hints — browser/device may ignore unsupported ones
+            focusMode: { ideal: 'continuous' },
+            exposureMode: { ideal: 'continuous' },
+            whiteBalanceMode: { ideal: 'continuous' },
+          }
+        };
+
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        videoEl.srcObject = stream;
+        await videoEl.play();
+
+        // Try to enable torch (flash) for better lighting on supported devices
+        const track = stream.getVideoTracks()[0];
+        const capabilities = track.getCapabilities ? track.getCapabilities() : {};
+
+        // Set up ImageCapture API for high-res still frames
+        if (typeof ImageCapture !== 'undefined') {
+          imageCapture = new ImageCapture(track);
+        }
+
+        // Apply optimal camera settings if supported
+        if (track.applyConstraints) {
+          try {
+            const advancedConstraints = {};
+            if (capabilities.focusMode && capabilities.focusMode.includes('continuous')) {
+              advancedConstraints.focusMode = 'continuous';
+            }
+            if (capabilities.exposureMode) {
+              advancedConstraints.exposureMode = 'continuous';
+            }
+            if (Object.keys(advancedConstraints).length > 0) {
+              await track.applyConstraints({ advanced: [advancedConstraints] });
+            }
+          } catch (e) {
+            // Not all devices support advanced constraints — that's fine
+          }
+        }
+
+        // Periodically trigger refocus by briefly switching focus mode
+        // This combats the phone "locking" focus on the wrong distance
+        setInterval(() => cycleFocus(track, capabilities), FOCUS_CYCLE_MS);
+
+        setGuidance('Position the barcode inside the frame');
+      } catch (err) {
+        document.body.innerHTML = `<div class="error">
+          <h2>Camera access needed</h2>
+          <p>${err.message}</p>
+          <p style="margin-top:1rem">Allow camera access, then reload.</p>
+        </div>`;
+      }
+    }
+
+    /**
+     * Focus cycling trick: briefly switch to manual focus then back to continuous.
+     * Forces the camera to re-evaluate focus, improving chances on small codes.
+     */
+    async function cycleFocus(track, capabilities) {
+      if (!capabilities.focusMode || !capabilities.focusMode.includes('continuous')) return;
+      try {
+        if (capabilities.focusMode.includes('manual')) {
+          await track.applyConstraints({ advanced: [{ focusMode: 'manual' }] });
+          await new Promise(r => setTimeout(r, 200));
+        }
+        await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+      } catch (e) { /* ignore */ }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // LAYER 1: CLIENT-SIDE LIVE DECODE (ZXing on video frames)
+    // Fast path — works for clean, well-lit, well-aligned codes
+    // ═══════════════════════════════════════════════════════════════
+    function startLiveDecoder() {
+      codeReader = new ZXingBrowser.BrowserMultiFormatReader();
+
+      // ZXing hints for pharma barcodes
+      const hints = new Map();
+      // Prioritize Data Matrix + Code 128 + EAN-13 (most common pharma formats)
+      // but still support all formats
+      hints.set(2, true); // TRY_HARDER — spend more CPU for better decode rate
+
+      codeReader.hints = hints;
+      codeReader.timeBetweenDecodingAttempts = 150; // ~7 FPS decode rate
+
+      codeReader.decodeFromVideoElement(videoEl, (result, err) => {
+        if (result) {
+          failedFrameCount = 0;
+          handleScan(result.getText(), result.getBarcodeFormat(), 'live');
+        } else {
+          failedFrameCount++;
+        }
+      });
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // LAYER 2: CLIENT-SIDE ENHANCED DECODE (Canvas preprocessing)
+    // When live decode fails, try preprocessing on the client first
+    // ═══════════════════════════════════════════════════════════════
+    async function clientEnhancedDecode() {
+      const frame = captureVideoFrame();
+      if (!frame) return null;
+
+      const ctx = processCanvas.getContext('2d', { willReadFrequently: true });
+      const { width, height } = frame;
+      processCanvas.width = width;
+      processCanvas.height = height;
+
+      // Try multiple client-side preprocessing strategies
+      const strategies = [
+        // Strategy 1: Grayscale + sharpen (convolution kernel)
+        () => {
+          ctx.drawImage(frame.source, 0, 0, width, height);
+          const imageData = ctx.getImageData(0, 0, width, height);
+          grayscale(imageData);
+          sharpen(imageData, width, height);
+          ctx.putImageData(imageData, 0, 0);
+        },
+        // Strategy 2: High contrast threshold
+        () => {
+          ctx.drawImage(frame.source, 0, 0, width, height);
+          const imageData = ctx.getImageData(0, 0, width, height);
+          grayscale(imageData);
+          threshold(imageData, 128);
+          ctx.putImageData(imageData, 0, 0);
+        },
+        // Strategy 3: Center crop + scale up (for small codes)
+        () => {
+          const cropW = Math.round(width * 0.4);
+          const cropH = Math.round(height * 0.4);
+          const sx = Math.round((width - cropW) / 2);
+          const sy = Math.round((height - cropH) / 2);
+          processCanvas.width = cropW * 2;
+          processCanvas.height = cropH * 2;
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
+          ctx.drawImage(frame.source, sx, sy, cropW, cropH, 0, 0, cropW * 2, cropH * 2);
+          const imageData = ctx.getImageData(0, 0, cropW * 2, cropH * 2);
+          grayscale(imageData);
+          sharpen(imageData, cropW * 2, cropH * 2);
+          ctx.putImageData(imageData, 0, 0);
+        },
+        // Strategy 4: Invert (dark packaging)
+        () => {
+          ctx.drawImage(frame.source, 0, 0, width, height);
+          const imageData = ctx.getImageData(0, 0, width, height);
+          grayscale(imageData);
+          invert(imageData);
+          threshold(imageData, 128);
+          ctx.putImageData(imageData, 0, 0);
+        },
+      ];
+
+      const singleReader = new ZXingBrowser.BrowserMultiFormatReader();
+      const hints = new Map();
+      hints.set(2, true); // TRY_HARDER
+      singleReader.hints = hints;
+
+      for (const strategy of strategies) {
+        try {
+          strategy();
+          const result = await decodeFromCanvas(singleReader, processCanvas);
+          if (result) return result;
+        } catch (e) { /* strategy failed, try next */ }
+      }
+
+      return null;
+    }
+
+    function decodeFromCanvas(reader, canvas) {
+      return new Promise((resolve) => {
+        try {
+          // Create an image from canvas and decode
+          const img = new Image();
+          img.onload = async () => {
+            try {
+              const result = await reader.decodeFromImageElement(img);
+              resolve({ text: result.getText(), format: result.getBarcodeFormat() });
+            } catch {
+              resolve(null);
+            }
+          };
+          img.onerror = () => resolve(null);
+          img.src = canvas.toDataURL('image/png');
+        } catch {
+          resolve(null);
+        }
+      });
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // LAYER 3: SERVER-SIDE DECODE (Sharp preprocessing pipeline)
+    // Heavy artillery — sends frame to server for 10+ preprocessing
+    // variants, then tries to decode each one client-side
+    // ═══════════════════════════════════════════════════════════════
+    async function serverSideDecode(trigger) {
+      if (isServerDecoding) return;
+      isServerDecoding = true;
+
+      overlayEl.classList.add('processing');
+      modeEl.textContent = 'Enhanced scan...';
+      modeEl.classList.add('server');
+      manualBtn.classList.add('processing');
+      setGuidance('Processing — hold steady...', true);
+
+      try {
+        // Capture the best frame we can get
+        const frameData = await captureHighResFrame();
+        if (!frameData) {
+          setGuidance('Capture failed — try again');
+          return;
+        }
+
+        // Send to server for preprocessing
+        const response = await fetch('/api/decode-image', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ image: frameData })
+        });
+
+        if (!response.ok) throw new Error('Server error');
+
+        const { quality, variants } = await response.json();
+
+        // Show quality feedback
+        if (quality.sharpness < 20) {
+          setGuidance('Image is blurry — hold phone steadier', true);
+        } else if (quality.sharpness < 40) {
+          setGuidance('Trying enhanced decode...', true);
+        }
+
+        // Try to decode each server-processed variant
+        const singleReader = new ZXingBrowser.BrowserMultiFormatReader();
+        const hints = new Map();
+        hints.set(2, true);
+        singleReader.hints = hints;
+
+        for (const variant of variants) {
+          try {
+            const img = new Image();
+            const loaded = new Promise((resolve, reject) => {
+              img.onload = resolve;
+              img.onerror = reject;
+            });
+            img.src = variant.dataUrl;
+            await loaded;
+
+            const result = await singleReader.decodeFromImageElement(img);
+            if (result) {
+              handleScan(result.getText(), result.getBarcodeFormat(), `server:${variant.name}`);
+              setGuidance(`Decoded via ${variant.name}`);
+              return; // Success!
+            }
+          } catch {
+            // This variant didn't work, try next
+          }
+        }
+
+        // All variants failed
+        setGuidance('Could not decode — move closer or improve lighting', true);
+
+      } catch (err) {
+        console.error('Server decode error:', err);
+        setGuidance('Processing error — try again');
+      } finally {
+        isServerDecoding = false;
+        overlayEl.classList.remove('processing');
+        modeEl.textContent = 'Live scan';
+        modeEl.classList.remove('server');
+        manualBtn.classList.remove('processing');
+      }
+    }
+
+    /**
+     * Capture a high-resolution still frame.
+     * Uses ImageCapture API when available (gets a full-res photo, not a video frame).
+     * Falls back to canvas capture from video.
+     */
+    async function captureHighResFrame() {
+      // Method 1: ImageCapture API — gets a real camera still (much higher res)
+      if (imageCapture) {
+        try {
+          const blob = await imageCapture.takePhoto({
+            imageWidth: 3264,  // Request high res
+            imageHeight: 2448,
+          });
+          return await blobToDataUrl(blob);
+        } catch (e) {
+          // ImageCapture may fail on some devices; fall through to canvas
+        }
+      }
+
+      // Method 2: Grab from video via canvas (lower res but reliable)
+      const frame = captureVideoFrame();
+      if (!frame) return null;
+
+      captureCanvas.width = frame.width;
+      captureCanvas.height = frame.height;
+      const ctx = captureCanvas.getContext('2d');
+      ctx.drawImage(frame.source, 0, 0);
+      return captureCanvas.toDataURL('image/jpeg', 0.95);
+    }
+
+    function captureVideoFrame() {
+      if (!videoEl.videoWidth) return null;
+      return {
+        source: videoEl,
+        width: videoEl.videoWidth,
+        height: videoEl.videoHeight
+      };
+    }
+
+    function blobToDataUrl(blob) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // FAILURE MONITOR — auto-escalates through decode layers
+    // ═══════════════════════════════════════════════════════════════
+    function startFailureMonitor() {
+      setInterval(async () => {
+        if (failedFrameCount < FAILED_FRAMES_BEFORE_SERVER) return;
+        if (isServerDecoding) return;
+
+        // Layer 2: Try client-side enhanced decode first
+        setGuidance('Trying enhanced processing...');
+        const enhanced = await clientEnhancedDecode();
+        if (enhanced) {
+          failedFrameCount = 0;
+          handleScan(enhanced.text, enhanced.format, 'client-enhanced');
+          return;
+        }
+
+        // Layer 3: Escalate to server
+        failedFrameCount = 0; // Reset to avoid spamming
+        await serverSideDecode('auto');
+
+      }, SERVER_DECODE_INTERVAL);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // IMAGE PROCESSING FUNCTIONS (client-side Canvas operations)
+    // ═══════════════════════════════════════════════════════════════
+    function grayscale(imageData) {
+      const d = imageData.data;
+      for (let i = 0; i < d.length; i += 4) {
+        const g = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        d[i] = d[i + 1] = d[i + 2] = g;
+      }
+    }
+
+    function threshold(imageData, t) {
+      const d = imageData.data;
+      for (let i = 0; i < d.length; i += 4) {
+        const v = d[i] >= t ? 255 : 0;
+        d[i] = d[i + 1] = d[i + 2] = v;
+      }
+    }
+
+    function invert(imageData) {
+      const d = imageData.data;
+      for (let i = 0; i < d.length; i += 4) {
+        d[i] = 255 - d[i];
+        d[i + 1] = 255 - d[i + 1];
+        d[i + 2] = 255 - d[i + 2];
+      }
+    }
+
+    function sharpen(imageData, w, h) {
+      // 3x3 unsharp mask kernel
+      const d = imageData.data;
+      const copy = new Uint8ClampedArray(d);
+      const kernel = [0, -1, 0, -1, 5, -1, 0, -1, 0];
+
+      for (let y = 1; y < h - 1; y++) {
+        for (let x = 1; x < w - 1; x++) {
+          const idx = (y * w + x) * 4;
+          for (let c = 0; c < 3; c++) {
+            let sum = 0;
+            for (let ky = -1; ky <= 1; ky++) {
+              for (let kx = -1; kx <= 1; kx++) {
+                const kidx = ((y + ky) * w + (x + kx)) * 4 + c;
+                sum += copy[kidx] * kernel[(ky + 1) * 3 + (kx + 1)];
+              }
+            }
+            d[idx + c] = Math.min(255, Math.max(0, sum));
+          }
+        }
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // WEBSOCKET + SCAN HANDLING
+    // ═══════════════════════════════════════════════════════════════
     function connectWebSocket() {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       ws = new WebSocket(`${protocol}//${window.location.host}?session=${sessionId}&role=phone`);
@@ -74,89 +544,40 @@
 
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
-        if (msg.type === 'scan-result') {
-          showScanResult(msg);
-        }
+        if (msg.type === 'scan-result') showScanResult(msg);
       };
 
       ws.onclose = () => {
-        statusEl.textContent = 'Disconnected — reloading...';
+        statusEl.textContent = 'Disconnected — reconnecting...';
         statusEl.classList.remove('ok');
-        setTimeout(() => window.location.reload(), 3000);
+        setTimeout(() => connectWebSocket(), 2000);
       };
     }
 
-    async function startScanner() {
-      try {
-        // Use ZXing multi-format reader for broad barcode support
-        const codeReader = new ZXingBrowser.BrowserMultiFormatReader();
-
-        // Get rear camera
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const videoDevices = devices.filter(d => d.kind === 'videoinput');
-        // Prefer rear/environment camera
-        const rearCamera = videoDevices.find(d =>
-          d.label.toLowerCase().includes('back') ||
-          d.label.toLowerCase().includes('rear') ||
-          d.label.toLowerCase().includes('environment')
-        );
-        const deviceId = rearCamera ? rearCamera.deviceId : undefined;
-
-        const constraints = {
-          video: {
-            deviceId: deviceId ? { exact: deviceId } : undefined,
-            facingMode: deviceId ? undefined : { ideal: 'environment' },
-            width: { ideal: 1280 },
-            height: { ideal: 720 }
-          }
-        };
-
-        const stream = await navigator.mediaDevices.getUserMedia(constraints);
-        videoEl.srcObject = stream;
-
-        // Continuous decode from video
-        codeReader.decodeFromVideoDevice(
-          deviceId || undefined,
-          'video',
-          (result, err) => {
-            if (result) {
-              handleScan(result.getText(), result.getBarcodeFormat());
-            }
-          }
-        );
-      } catch (err) {
-        document.body.innerHTML = `<div class="error">
-          <h2>Camera access required</h2>
-          <p>${err.message}</p>
-          <p style="margin-top:1rem">Please allow camera access and reload.</p>
-        </div>`;
-      }
-    }
-
-    function handleScan(barcode, format) {
+    function handleScan(barcode, format, method) {
       const now = Date.now();
-      // Debounce: ignore same barcode within 2 seconds
-      if (barcode === lastBarcode && (now - lastScanTime) < DEBOUNCE_MS) {
-        return;
-      }
+      if (barcode === lastBarcode && (now - lastScanTime) < DEBOUNCE_MS) return;
+
       lastBarcode = barcode;
       lastScanTime = now;
       scanCount++;
       scanCountEl.textContent = `${scanCount} scan${scanCount !== 1 ? 's' : ''}`;
+      failedFrameCount = 0;
 
-      // Flash overlay green
+      // Visual + haptic feedback
       overlayEl.classList.add('scanned');
-      setTimeout(() => overlayEl.classList.remove('scanned'), 500);
-
-      // Vibrate if supported
+      setTimeout(() => overlayEl.classList.remove('scanned'), 600);
       if (navigator.vibrate) navigator.vibrate(100);
 
-      // Send to server via WebSocket
+      setGuidance(`Decoded (${method})`);
+
+      // Send to server
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
           type: 'scan',
-          barcode: barcode,
-          format: formatName(format)
+          barcode,
+          format: formatName(format),
+          method
         }));
       }
     }
@@ -176,6 +597,11 @@
           <div class="info">Sent to desktop</div>
         `;
       }
+    }
+
+    function setGuidance(text, isWarn = false) {
+      guidanceEl.textContent = text;
+      guidanceEl.classList.toggle('warn', isWarn);
     }
 
     function formatName(format) {
