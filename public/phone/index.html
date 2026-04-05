@@ -5,8 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
   <meta name="referrer" content="no-referrer">
   <title>Pupillo — Scan Medicine</title>
-  <script src="https://unpkg.com/@AmbiqAI/zxing-browser@0.1.6/dist/zxing-browser.umd.min.js"
-    onerror="document.body.innerHTML='<div style=\'color:#ff6b6b;padding:2rem;text-align:center\'><h2>Failed to load scanner library</h2><p>Check network connection and reload.</p></div>'"></script>
+  <!-- zxing-wasm: C++ zxing compiled to WASM — supports Data Matrix structured append -->
+  <script src="https://cdn.jsdelivr.net/npm/zxing-wasm@3.0.2/dist/iife/reader/index.js"
+    onerror="document.body.innerHTML='<div style=\'color:#ff6b6b;padding:2rem;text-align:center\'><h2>Failed to load scanner</h2><p>Check network and reload.</p></div>'"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: white; min-height: 100vh; display: flex; flex-direction: column; }
@@ -18,12 +19,13 @@
     #video { width: 100%; height: 100%; object-fit: cover; }
     .scan-overlay {
       position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-      width: 240px; height: 240px;
+      width: 280px; height: 280px;
       border: 2px solid rgba(255,255,255,0.5); border-radius: 12px;
       pointer-events: none; transition: all 0.2s;
     }
     .scan-overlay.scanned { border-color: #28a745; box-shadow: 0 0 30px rgba(40,167,69,0.6); }
     .scan-overlay.processing { border-color: #ffc107; box-shadow: 0 0 20px rgba(255,193,7,0.4); animation: pulse 1s infinite; }
+    .scan-overlay.partial { border-color: #17a2b8; box-shadow: 0 0 15px rgba(23,162,184,0.4); }
     .scan-overlay .corners { position: absolute; inset: -2px; }
     .scan-overlay .corner { position: absolute; width: 20px; height: 20px; border: 3px solid white; }
     .scan-overlay .corner.tl { top: 0; left: 0; border-right: none; border-bottom: none; border-radius: 8px 0 0 0; }
@@ -32,6 +34,7 @@
     .scan-overlay .corner.br { bottom: 0; right: 0; border-left: none; border-top: none; border-radius: 0 0 8px 0; }
     .guidance { position: absolute; bottom: 0; left: 0; right: 0; text-align: center; padding: 0.8rem; background: linear-gradient(transparent, rgba(0,0,0,0.8)); font-size: 0.9rem; color: #ddd; }
     .guidance.warn { color: #ffc107; }
+    .guidance.info { color: #17a2b8; }
     .scan-count { position: absolute; top: 0.8rem; right: 0.8rem; background: rgba(0,0,0,0.6); padding: 0.3rem 0.8rem; border-radius: 20px; font-size: 0.85rem; }
     .mode-indicator { position: absolute; top: 0.8rem; left: 0.8rem; background: rgba(0,0,0,0.6); padding: 0.3rem 0.8rem; border-radius: 20px; font-size: 0.75rem; }
     .mode-indicator.server { background: rgba(255,193,7,0.3); color: #ffc107; }
@@ -50,7 +53,7 @@
 <body>
   <div class="header">
     <h1>Pupillo Scanner</h1>
-    <div class="status" id="status">Connecting...</div>
+    <div class="status" id="status">Loading WASM...</div>
   </div>
 
   <div class="camera-container">
@@ -63,7 +66,7 @@
     </div>
     <div class="scan-count" id="scanCount">0 scans</div>
     <div class="mode-indicator" id="modeIndicator">Live scan</div>
-    <div class="guidance" id="guidance">Position barcode inside the frame</div>
+    <div class="guidance" id="guidance">Initializing scanner...</div>
     <button class="manual-btn" id="manualBtn">Tap to capture &amp; enhance</button>
   </div>
 
@@ -72,7 +75,6 @@
   </div>
 
   <canvas id="captureCanvas"></canvas>
-  <canvas id="processCanvas"></canvas>
 
   <script>
     // ═══════════════════════════════════════════════════════════════
@@ -88,11 +90,13 @@
     // ═══════════════════════════════════════════════════════════════
     // CONFIGURATION
     // ═══════════════════════════════════════════════════════════════
+    const SCAN_INTERVAL_MS = 200;           // ~5 FPS decode rate
     const DEBOUNCE_MS = 2000;
     const SERVER_DECODE_INTERVAL = 3000;
     const FAILED_FRAMES_BEFORE_SERVER = 15;
     const FOCUS_CYCLE_MS = 4000;
     const MAX_RECONNECT_ATTEMPTS = 10;
+    const STRUCTURED_APPEND_TIMEOUT = 10000; // 10s to collect all parts
 
     // ═══════════════════════════════════════════════════════════════
     // DOM
@@ -106,7 +110,6 @@
     const manualBtn = document.getElementById('manualBtn');
     const videoEl = document.getElementById('video');
     const captureCanvas = document.getElementById('captureCanvas');
-    const processCanvas = document.getElementById('processCanvas');
 
     // ═══════════════════════════════════════════════════════════════
     // STATE
@@ -120,14 +123,29 @@
     let lastScanTime = 0;
     let failedFrameCount = 0;
     let isServerDecoding = false;
+    let isScanning = false;
     let stream = null;
     let imageCapture = null;
-    let codeReader = null;
     let reconnectAttempts = 0;
     let focusIntervalId = null;
     let failureMonitorId = null;
-    // Reusable ZXing reader for enhanced/server decode (avoid leak)
-    let enhancedReader = null;
+    let scanLoopId = null;
+
+    // Structured append reassembly buffer
+    // Key: sequenceId → { parts: Map<index, Uint8Array>, total: number, startTime: number }
+    const appendBuffer = new Map();
+
+    // zxing-wasm reader options
+    const readerOptions = {
+      formats: ['DataMatrix', 'QRCode', 'EAN13', 'EAN8', 'Code128', 'Code39',
+                'UPCA', 'UPCE', 'PDF417', 'Aztec', 'Codabar', 'ITF',
+                'DataBar', 'DataBarExp'],
+      tryHarder: true,
+      tryRotate: true,
+      tryInvert: true,
+      tryDownscale: true,
+      maxNumberOfSymbols: 6, // Scan up to 6 symbols per frame (for structured append)
+    };
 
     if (!sessionId || !sessionToken) {
       document.body.innerHTML = '<div class="error"><h2>No session</h2><p>Scan the QR code on your desktop screen.</p></div>';
@@ -136,20 +154,26 @@
     }
 
     async function init() {
-      enhancedReader = new ZXingBrowser.BrowserMultiFormatReader();
-      const hints = new Map();
-      hints.set(2, true);
-      enhancedReader.hints = hints;
+      // Initialize zxing-wasm (loads WASM binary from jsdelivr CDN)
+      try {
+        statusEl.textContent = 'Loading scanner engine...';
+        // Prepare the WASM module (will be loaded on first readBarcodes call)
+        ZXingWASM.prepareZXingModule();
+        statusEl.textContent = 'Scanner ready';
+      } catch (err) {
+        document.body.innerHTML = `<div class="error"><h2>Scanner init failed</h2><p>${esc(err.message)}</p></div>`;
+        return;
+      }
 
       connectWebSocket();
       await startCamera();
-      startLiveDecoder();
+      startScanLoop();
       startFailureMonitor();
       manualBtn.addEventListener('click', () => serverSideDecode('manual'));
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // LAYER 0: CAMERA
+    // CAMERA
     // ═══════════════════════════════════════════════════════════════
     async function startCamera() {
       try {
@@ -178,10 +202,9 @@
             if (capabilities.focusMode && capabilities.focusMode.includes('continuous')) adv.focusMode = 'continuous';
             if (capabilities.exposureMode) adv.exposureMode = 'continuous';
             if (Object.keys(adv).length > 0) await track.applyConstraints({ advanced: [adv] });
-          } catch (e) { /* unsupported — fine */ }
+          } catch (e) { /* unsupported */ }
         }
 
-        // Focus cycling — store interval ID for cleanup
         if (focusIntervalId) clearInterval(focusIntervalId);
         focusIntervalId = setInterval(() => cycleFocus(track, capabilities), FOCUS_CYCLE_MS);
 
@@ -207,100 +230,140 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // LAYER 1: LIVE ZXing DECODE
+    // SCAN LOOP — captures video frames and decodes with zxing-wasm
     // ═══════════════════════════════════════════════════════════════
-    function startLiveDecoder() {
-      codeReader = new ZXingBrowser.BrowserMultiFormatReader();
-      const hints = new Map();
-      hints.set(2, true);
-      codeReader.hints = hints;
-      codeReader.timeBetweenDecodingAttempts = 150;
+    function startScanLoop() {
+      if (scanLoopId) clearInterval(scanLoopId);
 
-      codeReader.decodeFromVideoElement(videoEl, (result, err) => {
-        if (result) {
-          failedFrameCount = 0;
-          handleScan(result.getText(), result.getBarcodeFormat(), 'live');
-        } else {
+      scanLoopId = setInterval(async () => {
+        if (isScanning || isServerDecoding) return;
+        if (!videoEl.videoWidth) return;
+        isScanning = true;
+
+        try {
+          // Capture frame from video to canvas → ImageData
+          const w = videoEl.videoWidth;
+          const h = videoEl.videoHeight;
+          captureCanvas.width = w;
+          captureCanvas.height = h;
+          const ctx = captureCanvas.getContext('2d', { willReadFrequently: true });
+          ctx.drawImage(videoEl, 0, 0, w, h);
+          const imageData = ctx.getImageData(0, 0, w, h);
+
+          // Decode with zxing-wasm
+          const results = await ZXingWASM.readBarcodes(imageData, readerOptions);
+
+          if (results.length > 0) {
+            processResults(results);
+          } else {
+            failedFrameCount++;
+          }
+        } catch (err) {
+          // WASM decode error — skip frame
           failedFrameCount++;
+        } finally {
+          isScanning = false;
         }
-      });
+      }, SCAN_INTERVAL_MS);
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // LAYER 2: CLIENT-SIDE ENHANCED DECODE
+    // STRUCTURED APPEND REASSEMBLY
+    //
+    // BMP barcodes use Data Matrix structured append: multiple symbols
+    // that need to be collected and concatenated in order.
+    // zxing-wasm exposes: sequenceSize, sequenceIndex, sequenceId
     // ═══════════════════════════════════════════════════════════════
-    async function clientEnhancedDecode() {
-      const frame = captureVideoFrame();
-      if (!frame) return null;
+    function processResults(results) {
+      for (const result of results) {
+        if (!result.isValid) continue;
 
-      const ctx = processCanvas.getContext('2d', { willReadFrequently: true });
-      const { width, height } = frame;
-      processCanvas.width = width;
-      processCanvas.height = height;
+        const { sequenceSize, sequenceIndex, sequenceId } = result;
 
-      const strategies = [
-        () => {
-          ctx.drawImage(frame.source, 0, 0, width, height);
-          const imageData = ctx.getImageData(0, 0, width, height);
-          grayscale(imageData); sharpen(imageData, width, height);
-          ctx.putImageData(imageData, 0, 0);
-        },
-        () => {
-          ctx.drawImage(frame.source, 0, 0, width, height);
-          const imageData = ctx.getImageData(0, 0, width, height);
-          grayscale(imageData); threshold(imageData, 128);
-          ctx.putImageData(imageData, 0, 0);
-        },
-        () => {
-          const cropW = Math.round(width * 0.4);
-          const cropH = Math.round(height * 0.4);
-          const sx = Math.round((width - cropW) / 2);
-          const sy = Math.round((height - cropH) / 2);
-          processCanvas.width = cropW * 2;
-          processCanvas.height = cropH * 2;
-          ctx.imageSmoothingEnabled = true;
-          ctx.imageSmoothingQuality = 'high';
-          ctx.drawImage(frame.source, sx, sy, cropW, cropH, 0, 0, cropW * 2, cropH * 2);
-          const imageData = ctx.getImageData(0, 0, cropW * 2, cropH * 2);
-          grayscale(imageData); sharpen(imageData, cropW * 2, cropH * 2);
-          ctx.putImageData(imageData, 0, 0);
-        },
-        () => {
-          ctx.drawImage(frame.source, 0, 0, width, height);
-          const imageData = ctx.getImageData(0, 0, width, height);
-          grayscale(imageData); invertPixels(imageData); threshold(imageData, 128);
-          ctx.putImageData(imageData, 0, 0);
-        },
-      ];
+        // Non-structured-append barcode (single symbol)
+        if (sequenceSize <= 0) {
+          failedFrameCount = 0;
+          // For binary content (like BMP), use raw bytes converted to latin1
+          const barcode = bytesToLatin1(result.bytes);
+          handleScan(barcode, result.format, 'live');
+          continue;
+        }
 
-      for (const strategy of strategies) {
-        try {
-          strategy();
-          const result = await decodeFromCanvas(enhancedReader, processCanvas);
-          if (result) return result;
-        } catch (e) { /* try next */ }
+        // Structured append symbol — add to reassembly buffer
+        const key = sequenceId || 'default';
+        if (!appendBuffer.has(key)) {
+          appendBuffer.set(key, {
+            parts: new Map(),
+            total: sequenceSize,
+            startTime: Date.now(),
+          });
+        }
+
+        const buf = appendBuffer.get(key);
+        buf.parts.set(sequenceIndex, new Uint8Array(result.bytes));
+
+        // Update UI with progress
+        const collected = buf.parts.size;
+        overlayEl.classList.add('partial');
+        setGuidance(`Scanning multi-part barcode: ${collected}/${buf.total}`, false, true);
+
+        // Check if we have all parts
+        if (collected >= buf.total) {
+          // Reassemble in order
+          const ordered = [];
+          for (let i = 0; i < buf.total; i++) {
+            const part = buf.parts.get(i);
+            if (!part) {
+              setGuidance(`Missing part ${i + 1} — keep scanning`, true);
+              return; // Missing a part — keep trying
+            }
+            ordered.push(part);
+          }
+
+          // Concatenate all parts
+          const totalLen = ordered.reduce((s, p) => s + p.length, 0);
+          const combined = new Uint8Array(totalLen);
+          let offset = 0;
+          for (const part of ordered) {
+            combined.set(part, offset);
+            offset += part.length;
+          }
+
+          appendBuffer.delete(key);
+          overlayEl.classList.remove('partial');
+
+          failedFrameCount = 0;
+          const barcode = bytesToLatin1(combined);
+          handleScan(barcode, 'DataMatrix', `live:structured-append(${buf.total})`);
+        }
       }
-      return null;
+
+      // Clean up stale append buffers
+      const now = Date.now();
+      for (const [key, buf] of appendBuffer) {
+        if (now - buf.startTime > STRUCTURED_APPEND_TIMEOUT) {
+          appendBuffer.delete(key);
+          overlayEl.classList.remove('partial');
+        }
+      }
     }
 
-    function decodeFromCanvas(reader, canvas) {
-      return new Promise((resolve) => {
-        try {
-          const img = new Image();
-          img.onload = async () => {
-            try {
-              const result = await reader.decodeFromImageElement(img);
-              resolve({ text: result.getText(), format: result.getBarcodeFormat() });
-            } catch { resolve(null); }
-          };
-          img.onerror = () => resolve(null);
-          img.src = canvas.toDataURL('image/png');
-        } catch { resolve(null); }
-      });
+    /**
+     * Convert raw bytes to a Latin-1 string (preserves byte values 0-255).
+     * This is how binary Data Matrix content (like BMP's "MP" + zlib)
+     * gets transmitted as a string through WebSocket to the server,
+     * where Buffer.from(str, 'latin1') recovers the exact bytes.
+     */
+    function bytesToLatin1(bytes) {
+      let str = '';
+      for (let i = 0; i < bytes.length; i++) {
+        str += String.fromCharCode(bytes[i]);
+      }
+      return str;
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // LAYER 3: SERVER-SIDE DECODE
+    // SERVER-SIDE ENHANCED DECODE
     // ═══════════════════════════════════════════════════════════════
     async function serverSideDecode(trigger) {
       if (isServerDecoding) return;
@@ -331,19 +394,18 @@
           setGuidance('Trying enhanced decode...', true);
         }
 
+        // Try to decode each server-preprocessed variant with zxing-wasm
         for (const variant of variants) {
           try {
-            const img = new Image();
-            const loaded = new Promise((resolve, reject) => {
-              img.onload = resolve;
-              img.onerror = reject;
-            });
-            img.src = variant.dataUrl;
-            await loaded;
+            // Convert base64 data URL to blob for zxing-wasm
+            const resp = await fetch(variant.dataUrl);
+            const blob = await resp.blob();
+            const results = await ZXingWASM.readBarcodes(blob, readerOptions);
 
-            const result = await enhancedReader.decodeFromImageElement(img);
-            if (result) {
-              handleScan(result.getText(), result.getBarcodeFormat(), `server:${variant.name}`);
+            if (results.length > 0 && results[0].isValid) {
+              const r = results[0];
+              const barcode = bytesToLatin1(r.bytes);
+              handleScan(barcode, r.format, `server:${variant.name}`);
               setGuidance(`Decoded via ${variant.name}`);
               return;
             }
@@ -370,17 +432,11 @@
           return await blobToDataUrl(blob);
         } catch (e) { /* fall through */ }
       }
-      const frame = captureVideoFrame();
-      if (!frame) return null;
-      captureCanvas.width = frame.width;
-      captureCanvas.height = frame.height;
-      captureCanvas.getContext('2d').drawImage(frame.source, 0, 0);
-      return captureCanvas.toDataURL('image/jpeg', 0.95);
-    }
-
-    function captureVideoFrame() {
       if (!videoEl.videoWidth) return null;
-      return { source: videoEl, width: videoEl.videoWidth, height: videoEl.videoHeight };
+      captureCanvas.width = videoEl.videoWidth;
+      captureCanvas.height = videoEl.videoHeight;
+      captureCanvas.getContext('2d').drawImage(videoEl, 0, 0);
+      return captureCanvas.toDataURL('image/jpeg', 0.95);
     }
 
     function blobToDataUrl(blob) {
@@ -393,7 +449,7 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // FAILURE MONITOR
+    // FAILURE MONITOR — escalates to server-side decode
     // ═══════════════════════════════════════════════════════════════
     function startFailureMonitor() {
       if (failureMonitorId) clearInterval(failureMonitorId);
@@ -401,63 +457,9 @@
         if (failedFrameCount < FAILED_FRAMES_BEFORE_SERVER) return;
         if (isServerDecoding) return;
 
-        setGuidance('Trying enhanced processing...');
-        const enhanced = await clientEnhancedDecode();
-        if (enhanced) {
-          failedFrameCount = 0;
-          handleScan(enhanced.text, enhanced.format, 'client-enhanced');
-          return;
-        }
-
         failedFrameCount = 0;
         await serverSideDecode('auto');
       }, SERVER_DECODE_INTERVAL);
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    // IMAGE PROCESSING
-    // ═══════════════════════════════════════════════════════════════
-    function grayscale(imageData) {
-      const d = imageData.data;
-      for (let i = 0; i < d.length; i += 4) {
-        const g = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-        d[i] = d[i + 1] = d[i + 2] = g;
-      }
-    }
-
-    function threshold(imageData, t) {
-      const d = imageData.data;
-      for (let i = 0; i < d.length; i += 4) {
-        const v = d[i] >= t ? 255 : 0;
-        d[i] = d[i + 1] = d[i + 2] = v;
-      }
-    }
-
-    function invertPixels(imageData) {
-      const d = imageData.data;
-      for (let i = 0; i < d.length; i += 4) {
-        d[i] = 255 - d[i]; d[i + 1] = 255 - d[i + 1]; d[i + 2] = 255 - d[i + 2];
-      }
-    }
-
-    function sharpen(imageData, w, h) {
-      const d = imageData.data;
-      const copy = new Uint8ClampedArray(d);
-      const kernel = [0, -1, 0, -1, 5, -1, 0, -1, 0];
-      for (let y = 1; y < h - 1; y++) {
-        for (let x = 1; x < w - 1; x++) {
-          const idx = (y * w + x) * 4;
-          for (let c = 0; c < 3; c++) {
-            let sum = 0;
-            for (let ky = -1; ky <= 1; ky++) {
-              for (let kx = -1; kx <= 1; kx++) {
-                sum += copy[((y + ky) * w + (x + kx)) * 4 + c] * kernel[(ky + 1) * 3 + (kx + 1)];
-              }
-            }
-            d[idx + c] = Math.min(255, Math.max(0, sum));
-          }
-        }
-      }
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -481,18 +483,14 @@
 
       ws.onclose = (event) => {
         statusEl.classList.remove('ok');
-
-        // Session expired or invalid token — stop reconnecting
         if (event.code === 4001 || event.code === 4002) {
           statusEl.textContent = 'Session expired — scan the QR code again';
           return;
         }
-        // Too many phones
         if (event.code === 4005) {
           statusEl.textContent = 'Too many phones connected to this session';
           return;
         }
-
         if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
           reconnectAttempts++;
           const delay = Math.min(2000 * reconnectAttempts, 15000);
@@ -521,7 +519,7 @@
 
       try {
         if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'scan', barcode, format: formatName(format), method }));
+          ws.send(JSON.stringify({ type: 'scan', barcode, format: String(format), method }));
         }
       } catch (e) { /* connection closing */ }
     }
@@ -529,33 +527,30 @@
     function showScanResult(msg) {
       const m = msg.medicine;
       if (m && m.found) {
+        const nameText = m.type === 'bmp'
+          ? (m.name || 'Medikationsplan erkannt')
+          : (m.name || 'Medicine Data Found');
         lastScanEl.innerHTML = `
-          <div class="name">${esc(m.name || 'Medicine Data Found')}</div>
-          <div class="barcode">${esc(msg.barcode)}</div>
-          <div class="info">${esc([m.manufacturer, m.strength, m.form].filter(Boolean).join(' — ') || 'Sent to desktop')}</div>
+          <div class="name">${esc(nameText)}</div>
+          <div class="info">${esc(
+            m.type === 'bmp'
+              ? `${m.sections ? m.sections.reduce((n,s) => n + (s.medications||[]).length, 0) : 0} Medikamente`
+              : [m.manufacturer, m.strength, m.form].filter(Boolean).join(' — ') || 'Sent to desktop'
+          )}</div>
         `;
       } else {
         lastScanEl.innerHTML = `
           <div class="name">Barcode Scanned</div>
-          <div class="barcode">${esc(msg.barcode)}</div>
+          <div class="barcode">${esc(msg.barcode.length > 60 ? msg.barcode.slice(0,60) + '...' : msg.barcode)}</div>
           <div class="info">Sent to desktop</div>
         `;
       }
     }
 
-    function setGuidance(text, isWarn = false) {
+    function setGuidance(text, isWarn = false, isInfo = false) {
       guidanceEl.textContent = text;
       guidanceEl.classList.toggle('warn', isWarn);
-    }
-
-    function formatName(format) {
-      const names = {
-        0: 'Aztec', 1: 'Codabar', 2: 'Code 39', 3: 'Code 93',
-        4: 'Code 128', 5: 'Data Matrix', 6: 'EAN-8', 7: 'EAN-13',
-        8: 'ITF', 9: 'MaxiCode', 10: 'PDF417', 11: 'QR Code',
-        12: 'RSS-14', 13: 'RSS Expanded', 14: 'UPC-A', 15: 'UPC-E', 16: 'UPC/EAN'
-      };
-      return names[format] || `Format ${format}`;
+      guidanceEl.classList.toggle('info', isInfo);
     }
   </script>
 </body>
