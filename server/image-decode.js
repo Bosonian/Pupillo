@@ -85,6 +85,29 @@ async function generateVariants(imageBuffer) {
     buffer: await sharp(buffer).grayscale().normalize().threshold(128).toBuffer()
   });
 
+  // V4b: Full-image upscale for low-res captures (phone far away or heavy downscale)
+  // Data Matrix needs ~3+ pixels per module; at 100 modules, that's 300px minimum
+  if (width < 600 || height < 600) {
+    const scale = Math.min(5, MAX_UPSCALE_DIM / Math.max(width, height));
+    if (scale > 1.5) {
+      variants.push({
+        name: 'full-upscale',
+        buffer: await sharp(buffer)
+          .resize(Math.round(width * scale), Math.round(height * scale), { kernel: 'lanczos3' })
+          .grayscale().normalize().sharpen({ sigma: 2 })
+          .toBuffer()
+      });
+      // Also upscale + threshold
+      variants.push({
+        name: 'full-upscale-threshold',
+        buffer: await sharp(buffer)
+          .resize(Math.round(width * scale), Math.round(height * scale), { kernel: 'lanczos3' })
+          .grayscale().normalize().threshold(128)
+          .toBuffer()
+      });
+    }
+  }
+
   // V5: Sharpen aggressively + contrast boost — for blurry captures
   variants.push({
     name: 'sharpen-heavy',
