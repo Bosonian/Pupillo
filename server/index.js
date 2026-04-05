@@ -2,75 +2,205 @@ const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 const path = require('path');
 const { processForDecode, assessQuality } = require('./image-decode');
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, maxPayload: 10 * 1024 * 1024 }); // 10MB for image frames
+const wss = new WebSocketServer({ server, maxPayload: 1024 }); // 1KB max for WS scan messages
 
-// Parse large JSON bodies (base64 images)
-app.use(express.json({ limit: '10mb' }));
+// Parse large JSON bodies (base64 images) — only for the decode endpoint
+const jsonParser = express.json({ limit: '10mb' });
+
+// Security headers
+app.use((_req, res, next) => {
+  res.set({
+    'X-Frame-Options': 'DENY',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws: wss:;",
+  });
+  next();
+});
 
 // Serve static files
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
-// Sessions: sessionId -> { desktop: ws|null, phones: Set<ws> }
+// ═══════════════════════════════════════════════════════════════
+// SESSION MANAGEMENT
+// ═══════════════════════════════════════════════════════════════
+
+const MAX_SESSIONS = 1000;
+const MAX_PHONES_PER_SESSION = 5;
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;   // 5 minutes
+
+// Sessions: sessionId -> { token, desktop, phones, createdAt, lastActivity }
 const sessions = new Map();
 
-// Clean up stale sessions every 5 minutes
+// Clean up stale sessions
 setInterval(() => {
+  const now = Date.now();
   for (const [id, session] of sessions) {
-    if (!session.desktop && session.phones.size === 0) {
+    const idle = !session.desktop && session.phones.size === 0;
+    const expired = (now - session.createdAt) > SESSION_TTL_MS;
+    if (idle || expired) {
+      // Close any lingering connections
+      if (session.desktop) safeSend(session.desktop, null, true);
+      for (const phone of session.phones) safeSend(phone, null, true);
       sessions.delete(id);
     }
   }
-}, 5 * 60 * 1000);
+}, CLEANUP_INTERVAL_MS);
 
-// REST endpoint: create a new session
-app.post('/api/session', (_req, res) => {
+// Rate limiters (simple in-memory per-IP)
+const rateLimits = new Map(); // ip -> { sessionCreates: number, imageDecodes: number, resetAt: number }
+
+function getRateLimit(ip) {
+  const now = Date.now();
+  let entry = rateLimits.get(ip);
+  if (!entry || now > entry.resetAt) {
+    entry = { sessionCreates: 0, imageDecodes: 0, resetAt: now + 60000 };
+    rateLimits.set(ip, entry);
+  }
+  return entry;
+}
+
+// Clean rate limit entries every minute
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of rateLimits) {
+    if (now > entry.resetAt) rateLimits.delete(ip);
+  }
+}, 60000);
+
+// ═══════════════════════════════════════════════════════════════
+// REST ENDPOINTS
+// ═══════════════════════════════════════════════════════════════
+
+// Create a new session — returns sessionId + secret token
+app.post('/api/session', (req, res) => {
+  // Rate limit: max 10 session creates per minute per IP
+  const rl = getRateLimit(req.ip);
+  if (rl.sessionCreates >= 10) {
+    return res.status(429).json({ error: 'Too many sessions — try again later' });
+  }
+  rl.sessionCreates++;
+
+  if (sessions.size >= MAX_SESSIONS) {
+    return res.status(503).json({ error: 'Server at capacity — try again later' });
+  }
+
   const sessionId = uuidv4();
-  sessions.set(sessionId, { desktop: null, phones: new Set() });
-  res.json({ sessionId });
+  const token = crypto.randomBytes(24).toString('base64url');
+
+  sessions.set(sessionId, {
+    token,
+    desktop: null,
+    phones: new Set(),
+    createdAt: Date.now(),
+    lastActivity: Date.now(),
+    scanCount: 0,
+  });
+
+  res.json({ sessionId, token });
 });
 
-// REST endpoint: lookup medicine data from barcode
+// Lookup medicine data from barcode
 app.get('/api/medicine/:barcode', (req, res) => {
-  const data = lookupMedicine(req.params.barcode);
-  res.json(data);
+  const barcode = sanitizeBarcode(req.params.barcode);
+  if (!barcode) return res.status(400).json({ error: 'Invalid barcode' });
+  res.json(lookupMedicine(barcode));
 });
 
-// REST endpoint: server-side image processing for hard-to-decode barcodes
-// Phone sends a high-res still frame; server applies multiple preprocessing
-// strategies and returns enhanced images for client-side decode retry.
-app.post('/api/decode-image', async (req, res) => {
-  try {
-    const { image } = req.body; // base64 data URL
-    if (!image) return res.status(400).json({ error: 'No image provided' });
+// Server-side image processing for hard-to-decode barcodes
+// Concurrency limiter: only N simultaneous image decode operations
+let activeImageDecodes = 0;
+const MAX_CONCURRENT_DECODES = 3;
 
-    // Strip data URL prefix
-    const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
+app.post('/api/decode-image', jsonParser, async (req, res) => {
+  // Rate limit: max 10 image decodes per minute per IP
+  const rl = getRateLimit(req.ip);
+  if (rl.imageDecodes >= 10) {
+    return res.status(429).json({ error: 'Too many requests — try again later' });
+  }
+  rl.imageDecodes++;
+
+  if (activeImageDecodes >= MAX_CONCURRENT_DECODES) {
+    return res.status(503).json({ error: 'Server busy — try again shortly' });
+  }
+
+  activeImageDecodes++;
+  try {
+    const { image } = req.body;
+    if (!image || typeof image !== 'string') {
+      return res.status(400).json({ error: 'No image provided' });
+    }
+
+    // Strip data URL prefix (support all raster MIME types)
+    const base64Data = image.replace(/^data:image\/[^;]+;base64,/, '');
     const imageBuffer = Buffer.from(base64Data, 'base64');
 
-    // Assess image quality first
-    const quality = await assessQuality(imageBuffer);
+    // Validate it's a real raster image by checking magic bytes
+    if (!isValidImageBuffer(imageBuffer)) {
+      return res.status(400).json({ error: 'Invalid image format' });
+    }
 
-    // Generate preprocessed variants
+    const quality = await assessQuality(imageBuffer);
     const variants = await processForDecode(imageBuffer);
 
     res.json({ quality, variants });
   } catch (err) {
     console.error('Image decode error:', err);
     res.status(500).json({ error: 'Image processing failed' });
+  } finally {
+    activeImageDecodes--;
   }
 });
 
-// WebSocket handling
+function isValidImageBuffer(buf) {
+  if (buf.length < 4) return false;
+  // JPEG: FF D8 FF
+  if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return true;
+  // PNG: 89 50 4E 47
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return true;
+  // WebP: RIFF....WEBP
+  if (buf.length >= 12 && buf[0] === 0x52 && buf[1] === 0x49 && buf[8] === 0x57 && buf[9] === 0x45) return true;
+  return false;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// WEBSOCKET HANDLING
+// ═══════════════════════════════════════════════════════════════
+
+// Ping/pong keepalive — detect dead connections
+const PING_INTERVAL_MS = 30000;
+const pingInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, PING_INTERVAL_MS);
+wss.on('close', () => clearInterval(pingInterval));
+
 wss.on('connection', (ws, req) => {
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
   const url = new URL(req.url, `http://${req.headers.host}`);
   const sessionId = url.searchParams.get('session');
-  const role = url.searchParams.get('role'); // 'desktop' or 'phone'
+  const role = url.searchParams.get('role');
+  const token = url.searchParams.get('token');
 
+  // Validate role
+  if (role !== 'desktop' && role !== 'phone') {
+    ws.close(4003, 'Invalid role');
+    return;
+  }
+
+  // Validate session exists
   if (!sessionId || !sessions.has(sessionId)) {
     ws.close(4001, 'Invalid session');
     return;
@@ -78,20 +208,37 @@ wss.on('connection', (ws, req) => {
 
   const session = sessions.get(sessionId);
 
-  if (role === 'desktop') {
-    session.desktop = ws;
-    ws.send(JSON.stringify({ type: 'status', message: 'Waiting for phone to connect...' }));
-  } else if (role === 'phone') {
-    session.phones.add(ws);
-    // Notify desktop that a phone connected
-    if (session.desktop && session.desktop.readyState === 1) {
-      session.desktop.send(JSON.stringify({
-        type: 'phone-connected',
-        count: session.phones.size
-      }));
-    }
-    ws.send(JSON.stringify({ type: 'status', message: 'Connected! Start scanning.' }));
+  // Validate session token
+  if (!token || token !== session.token) {
+    ws.close(4002, 'Invalid token');
+    return;
   }
+
+  session.lastActivity = Date.now();
+
+  if (role === 'desktop') {
+    // Close existing desktop connection gracefully before replacing
+    if (session.desktop && session.desktop.readyState <= 1) {
+      session.desktop.close(4004, 'Replaced by new desktop connection');
+    }
+    session.desktop = ws;
+    safeSend(ws, { type: 'status', message: 'Waiting for phone to connect...' });
+  } else if (role === 'phone') {
+    // Cap max phones per session
+    if (session.phones.size >= MAX_PHONES_PER_SESSION) {
+      ws.close(4005, 'Too many phones connected');
+      return;
+    }
+    session.phones.add(ws);
+    if (session.desktop && session.desktop.readyState === 1) {
+      safeSend(session.desktop, { type: 'phone-connected', count: session.phones.size });
+    }
+    safeSend(ws, { type: 'status', message: 'Connected! Start scanning.' });
+  }
+
+  // Per-connection scan rate limiter
+  let scanBudget = 5;   // max scans per second
+  let scanBudgetReset = Date.now() + 1000;
 
   ws.on('message', (raw) => {
     let msg;
@@ -102,46 +249,101 @@ wss.on('connection', (ws, req) => {
     }
 
     if (msg.type === 'scan' && role === 'phone') {
-      // Phone scanned a barcode — enrich with medicine data and forward to desktop
-      const medicine = lookupMedicine(msg.barcode);
-      const payload = JSON.stringify({
+      // Rate limit scans
+      const now = Date.now();
+      if (now > scanBudgetReset) {
+        scanBudget = 5;
+        scanBudgetReset = now + 1000;
+      }
+      if (scanBudget <= 0) return;
+      scanBudget--;
+
+      // Validate barcode input
+      const barcode = sanitizeBarcode(msg.barcode);
+      if (!barcode) return;
+
+      const format = sanitizeFormat(msg.format);
+
+      session.lastActivity = now;
+      session.scanCount++;
+
+      const medicine = lookupMedicine(barcode);
+      const payload = {
         type: 'scan-result',
-        barcode: msg.barcode,
-        format: msg.format,
+        barcode,
+        format,
         medicine,
         timestamp: new Date().toISOString()
-      });
+      };
 
       if (session.desktop && session.desktop.readyState === 1) {
-        session.desktop.send(payload);
+        safeSend(session.desktop, payload);
       }
-      // Echo back to phone as confirmation
-      ws.send(payload);
+      safeSend(ws, payload);
     }
   });
 
   ws.on('close', () => {
     if (role === 'desktop') {
-      session.desktop = null;
+      // Only null out if THIS ws is still the current desktop
+      if (session.desktop === ws) {
+        session.desktop = null;
+      }
     } else if (role === 'phone') {
       session.phones.delete(ws);
       if (session.desktop && session.desktop.readyState === 1) {
-        session.desktop.send(JSON.stringify({
-          type: 'phone-disconnected',
-          count: session.phones.size
-        }));
+        safeSend(session.desktop, { type: 'phone-disconnected', count: session.phones.size });
       }
     }
   });
 });
 
-/**
- * Medicine lookup from barcode.
- * In production, this would query a real drug database (FDA NDC, RxNorm, openFDA, etc.)
- * For now, uses a demo dataset + parses GS1 barcode fields.
- */
+// Safe WebSocket send with error handling
+function safeSend(ws, data, doClose = false) {
+  try {
+    if (doClose) {
+      ws.terminate();
+      return;
+    }
+    if (ws.readyState === 1) {
+      ws.send(JSON.stringify(data), (err) => {
+        if (err) console.error('WS send error:', err.message);
+      });
+    }
+  } catch (e) {
+    // Connection already gone
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// INPUT VALIDATION
+// ═══════════════════════════════════════════════════════════════
+
+function sanitizeBarcode(barcode) {
+  if (typeof barcode !== 'string') return null;
+  if (barcode.length === 0 || barcode.length > 256) return null;
+  return barcode;
+}
+
+const VALID_FORMATS = new Set([
+  'Aztec', 'Codabar', 'Code 39', 'Code 93', 'Code 128', 'Data Matrix',
+  'EAN-8', 'EAN-13', 'ITF', 'MaxiCode', 'PDF417', 'QR Code',
+  'RSS-14', 'RSS Expanded', 'UPC-A', 'UPC-E', 'UPC/EAN',
+]);
+
+function sanitizeFormat(format) {
+  if (typeof format !== 'string') return 'unknown';
+  if (VALID_FORMATS.has(format)) return format;
+  // Allow "Format N" pattern from client formatName()
+  if (/^Format \d{1,3}$/.test(format)) return format;
+  return 'unknown';
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MEDICINE LOOKUP
+// ═══════════════════════════════════════════════════════════════
+
 function lookupMedicine(barcode) {
-  // Demo medicine database (keyed by NDC or UPC)
   const db = {
     '0363024601': { name: 'Ibuprofen 200mg', manufacturer: 'Walgreens', ndc: '0363-0246-01', form: 'Tablet', strength: '200mg' },
     '3614273547': { name: 'Amoxicillin 500mg', manufacturer: 'Generic Pharma', ndc: '3614-2735-47', form: 'Capsule', strength: '500mg' },
@@ -150,60 +352,121 @@ function lookupMedicine(barcode) {
     '0006027231': { name: 'Metformin 500mg', manufacturer: 'Merck', ndc: '0006-0272-31', form: 'Tablet', strength: '500mg' },
   };
 
-  // Direct match
   if (db[barcode]) {
     return { found: true, ...db[barcode] };
   }
 
-  // Try to parse GS1-128 / GS1 DataMatrix Application Identifiers
   const gs1 = parseGS1(barcode);
   if (gs1) {
     return { found: true, source: 'GS1', ...gs1 };
   }
 
-  return { found: false, rawBarcode: barcode, message: 'Medicine not found in demo database. In production, this would query FDA/openFDA.' };
+  return { found: false, message: 'Not found in demo database.' };
 }
 
-/**
- * Parse GS1 Application Identifiers commonly found on medicine packaging.
- * AI (01) = GTIN, AI (17) = Expiry, AI (10) = Batch/Lot, AI (21) = Serial
- */
+// ═══════════════════════════════════════════════════════════════
+// GS1 PARSER — Sequential AI parsing with FNC1/GS separator support
+// ═══════════════════════════════════════════════════════════════
+
+// Fixed-length AIs (AI code -> data length after the AI code)
+const FIXED_LENGTH_AIS = {
+  '00': 18, '01': 14, '02': 14,
+  '03': 14, '04': 16,
+  '11': 6, '12': 6, '13': 6, '15': 6, '16': 6, '17': 6,
+  '20': 2,
+};
+
+// Known variable-length AI prefixes (2-4 digit AI code)
+const VARIABLE_AIS = ['10', '21', '22', '240', '241', '250', '251', '30', '37'];
+
 function parseGS1(barcode) {
+  if (typeof barcode !== 'string' || barcode.length < 4) return null;
+
+  // GS1 uses FNC1 (represented as GS char \x1d, or sometimes ] prefix) as separator
+  // Normalize: replace common FNC1 representations
+  let str = barcode
+    .replace(/\x1d/g, '\x1d')         // keep GS chars
+    .replace(/\\x1[dD]/g, '\x1d')     // literal \x1d in string
+    .replace(/^\]C1/, '')              // AIM symbology identifier for GS1-128
+    .replace(/^\]d2/, '')              // AIM symbology identifier for DataMatrix
+    .replace(/^\]e0/, '');             // AIM symbology identifier for GS1 DataBar
+
   const result = {};
   let hasAny = false;
-  const str = barcode.replace(/[^0-9A-Za-z]/g, '');
+  let pos = 0;
 
-  // GTIN — AI 01 (14 digits)
-  const gtinMatch = str.match(/01(\d{14})/);
-  if (gtinMatch) {
-    result.gtin = gtinMatch[1];
-    hasAny = true;
-  }
+  while (pos < str.length) {
+    // Skip GS separators
+    if (str[pos] === '\x1d') { pos++; continue; }
 
-  // Expiry — AI 17 (6 digits YYMMDD)
-  const expiryMatch = str.match(/17(\d{6})/);
-  if (expiryMatch) {
-    const raw = expiryMatch[1];
-    result.expiry = `20${raw.slice(0, 2)}-${raw.slice(2, 4)}-${raw.slice(4, 6)}`;
-    hasAny = true;
-  }
+    let matched = false;
 
-  // Batch/Lot — AI 10 (variable length alphanumeric)
-  const lotMatch = str.match(/10([A-Za-z0-9]{1,20})/);
-  if (lotMatch) {
-    result.lot = lotMatch[1];
-    hasAny = true;
-  }
+    // Try fixed-length AIs first (most important for pharma: 01, 17)
+    for (const [ai, len] of Object.entries(FIXED_LENGTH_AIS)) {
+      if (str.startsWith(ai, pos)) {
+        const dataStart = pos + ai.length;
+        const data = str.slice(dataStart, dataStart + len);
+        if (data.length === len) {
+          setGS1Field(result, ai, data);
+          hasAny = true;
+          pos = dataStart + len;
+          matched = true;
+        }
+        break;
+      }
+    }
+    if (matched) continue;
 
-  // Serial — AI 21 (variable length alphanumeric)
-  const serialMatch = str.match(/21([A-Za-z0-9]{1,20})/);
-  if (serialMatch) {
-    result.serial = serialMatch[1];
-    hasAny = true;
+    // Try variable-length AIs (terminated by GS separator or end of string)
+    for (const ai of VARIABLE_AIS) {
+      if (str.startsWith(ai, pos)) {
+        const dataStart = pos + ai.length;
+        const gsPos = str.indexOf('\x1d', dataStart);
+        const dataEnd = gsPos !== -1 ? gsPos : str.length;
+        const data = str.slice(dataStart, dataEnd);
+        if (data.length > 0 && data.length <= 30) {
+          setGS1Field(result, ai, data);
+          hasAny = true;
+          pos = dataEnd;
+          matched = true;
+        }
+        break;
+      }
+    }
+    if (matched) continue;
+
+    // Unknown AI — skip one character to avoid infinite loop
+    pos++;
   }
 
   return hasAny ? result : null;
 }
+
+function setGS1Field(result, ai, data) {
+  switch (ai) {
+    case '01': result.gtin = data; break;
+    case '02': result.contentGtin = data; break;
+    case '10': result.lot = data; break;
+    case '11': result.productionDate = formatGS1Date(data); break;
+    case '17': result.expiry = formatGS1Date(data); break;
+    case '21': result.serial = data; break;
+    case '30': result.quantity = parseInt(data, 10) || data; break;
+    case '240': result.additionalId = data; break;
+  }
+}
+
+function formatGS1Date(yymmdd) {
+  const yy = yymmdd.slice(0, 2);
+  const mm = yymmdd.slice(2, 4);
+  const dd = yymmdd.slice(4, 6);
+  // GS1 spec: day "00" means last day of month
+  const dayStr = dd === '00' ? '(end)' : dd;
+  return `20${yy}-${mm}-${dayStr}`;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SERVER START
+// ═══════════════════════════════════════════════════════════════
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {

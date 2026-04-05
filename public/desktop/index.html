@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="referrer" content="no-referrer">
   <title>Pupillo — Desktop Medicine Scanner</title>
   <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
   <style>
@@ -60,20 +61,34 @@
   </div>
 
   <script>
+    // HTML escape to prevent XSS from barcode/medicine content
+    function esc(str) {
+      if (typeof str !== 'string') return '';
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
     const statusEl = document.getElementById('status');
     const resultsEl = document.getElementById('results');
     let ws;
     let isFirstScan = true;
+    let sessionId = null;
+    let sessionToken = null;
+    let reconnectAttempts = 0;
+    const MAX_RECONNECT_ATTEMPTS = 10;
 
     async function init() {
       // Create a session
       const res = await fetch('/api/session', { method: 'POST' });
-      const { sessionId } = await res.json();
+      const data = await res.json();
+      sessionId = data.sessionId;
+      sessionToken = data.token;
 
-      // Generate the phone URL
+      // Generate the phone URL (includes token for auth)
       const host = window.location.host;
       const protocol = window.location.protocol;
-      const phoneUrl = `${protocol}//${host}/phone/?session=${sessionId}`;
+      const phoneUrl = `${protocol}//${host}/phone/?session=${sessionId}&token=${sessionToken}`;
 
       // Render QR code
       QRCode.toCanvas(document.getElementById('qrCanvas'), phoneUrl, {
@@ -82,16 +97,23 @@
         color: { dark: '#1a1a2e', light: '#ffffff' }
       });
 
-      // Connect WebSocket
+      connectWebSocket();
+    }
+
+    function connectWebSocket() {
+      const host = window.location.host;
+      const protocol = window.location.protocol;
       const wsProtocol = protocol === 'https:' ? 'wss:' : 'ws:';
-      ws = new WebSocket(`${wsProtocol}//${host}?session=${sessionId}&role=desktop`);
+      ws = new WebSocket(`${wsProtocol}//${host}?session=${sessionId}&role=desktop&token=${sessionToken}`);
 
       ws.onopen = () => {
         statusEl.textContent = 'Waiting for phone...';
+        reconnectAttempts = 0;
       };
 
       ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
+        let msg;
+        try { msg = JSON.parse(event.data); } catch { return; }
 
         if (msg.type === 'phone-connected') {
           statusEl.textContent = `Phone connected (${msg.count})`;
@@ -110,9 +132,28 @@
         }
       };
 
-      ws.onclose = () => {
-        statusEl.textContent = 'Disconnected — refresh to reconnect';
+      ws.onclose = (event) => {
         statusEl.classList.remove('connected');
+
+        // Session expired or auth failed — don't reconnect
+        if (event.code === 4001 || event.code === 4002) {
+          statusEl.textContent = 'Session expired — refresh page';
+          return;
+        }
+        // We were replaced by another desktop tab
+        if (event.code === 4004) {
+          statusEl.textContent = 'Replaced by another desktop tab — refresh to reclaim';
+          return;
+        }
+
+        if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+          reconnectAttempts++;
+          const delay = Math.min(2000 * reconnectAttempts, 15000);
+          statusEl.textContent = `Reconnecting (${reconnectAttempts})...`;
+          setTimeout(() => connectWebSocket(), delay);
+        } else {
+          statusEl.textContent = 'Disconnected — refresh to reconnect';
+        }
       };
     }
 
@@ -143,16 +184,16 @@
         ].filter(Boolean);
 
         detailsHtml = `<div class="details">${fields.map(([label, value]) =>
-          `<div class="detail"><label>${label}</label><span>${value}</span></div>`
+          `<div class="detail"><label>${esc(label)}</label><span>${esc(String(value))}</span></div>`
         ).join('')}</div>`;
       }
 
       card.innerHTML = `
-        <div class="time">${time} &middot; ${msg.format || 'unknown format'}</div>
-        <div class="medicine-name">${found ? (msg.medicine.name || 'GS1 Medicine Data') : 'Unknown Barcode'}</div>
-        <div class="barcode-raw">${msg.barcode}</div>
+        <div class="time">${esc(time)} &middot; ${esc(msg.format || 'unknown format')}</div>
+        <div class="medicine-name">${found ? esc(msg.medicine.name || 'GS1 Medicine Data') : 'Unknown Barcode'}</div>
+        <div class="barcode-raw">${esc(msg.barcode)}</div>
         ${detailsHtml}
-        ${!found ? `<p style="color:#888;font-size:0.85rem;margin-top:0.5rem">${msg.medicine.message || ''}</p>` : ''}
+        ${!found ? `<p style="color:#888;font-size:0.85rem;margin-top:0.5rem">${esc(msg.medicine.message || '')}</p>` : ''}
       `;
 
       resultsEl.prepend(card);

@@ -3,8 +3,10 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <meta name="referrer" content="no-referrer">
   <title>Pupillo — Scan Medicine</title>
-  <script src="https://unpkg.com/@AmbiqAI/zxing-browser@0.1.6/dist/zxing-browser.umd.min.js"></script>
+  <script src="https://unpkg.com/@AmbiqAI/zxing-browser@0.1.6/dist/zxing-browser.umd.min.js"
+    onerror="document.body.innerHTML='<div style=\'color:#ff6b6b;padding:2rem;text-align:center\'><h2>Failed to load scanner library</h2><p>Check network connection and reload.</p></div>'"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: white; min-height: 100vh; display: flex; flex-direction: column; }
@@ -69,18 +71,28 @@
     <div class="info">Point camera at a medicine barcode</div>
   </div>
 
-  <!-- Hidden canvases for image processing -->
   <canvas id="captureCanvas"></canvas>
   <canvas id="processCanvas"></canvas>
 
   <script>
     // ═══════════════════════════════════════════════════════════════
+    // UTILITIES
+    // ═══════════════════════════════════════════════════════════════
+    function esc(str) {
+      if (typeof str !== 'string') return '';
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     // CONFIGURATION
     // ═══════════════════════════════════════════════════════════════
     const DEBOUNCE_MS = 2000;
-    const SERVER_DECODE_INTERVAL = 3000;  // How often to try server-side (ms)
-    const FAILED_FRAMES_BEFORE_SERVER = 15; // Client failures before auto-escalating
-    const FOCUS_CYCLE_MS = 4000;           // Refocus cycle interval
+    const SERVER_DECODE_INTERVAL = 3000;
+    const FAILED_FRAMES_BEFORE_SERVER = 15;
+    const FOCUS_CYCLE_MS = 4000;
+    const MAX_RECONNECT_ATTEMPTS = 10;
 
     // ═══════════════════════════════════════════════════════════════
     // DOM
@@ -101,6 +113,7 @@
     // ═══════════════════════════════════════════════════════════════
     const params = new URLSearchParams(window.location.search);
     const sessionId = params.get('session');
+    const sessionToken = params.get('token');
     let ws;
     let scanCount = 0;
     let lastBarcode = '';
@@ -108,16 +121,26 @@
     let failedFrameCount = 0;
     let isServerDecoding = false;
     let stream = null;
-    let imageCapture = null; // ImageCapture API for high-res stills
+    let imageCapture = null;
     let codeReader = null;
+    let reconnectAttempts = 0;
+    let focusIntervalId = null;
+    let failureMonitorId = null;
+    // Reusable ZXing reader for enhanced/server decode (avoid leak)
+    let enhancedReader = null;
 
-    if (!sessionId) {
-      document.body.innerHTML = '<div class="error"><h2>No session ID</h2><p>Scan the QR code on your desktop screen.</p></div>';
+    if (!sessionId || !sessionToken) {
+      document.body.innerHTML = '<div class="error"><h2>No session</h2><p>Scan the QR code on your desktop screen.</p></div>';
     } else {
       init();
     }
 
     async function init() {
+      enhancedReader = new ZXingBrowser.BrowserMultiFormatReader();
+      const hints = new Map();
+      hints.set(2, true);
+      enhancedReader.hints = hints;
+
       connectWebSocket();
       await startCamera();
       startLiveDecoder();
@@ -126,20 +149,15 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // LAYER 0: CAMERA — get the best raw input we can
+    // LAYER 0: CAMERA
     // ═══════════════════════════════════════════════════════════════
     async function startCamera() {
       try {
-        // Request high resolution + continuous autofocus
         const constraints = {
           video: {
             facingMode: { ideal: 'environment' },
             width: { ideal: 1920 },
             height: { ideal: 1080 },
-            // These are hints — browser/device may ignore unsupported ones
-            focusMode: { ideal: 'continuous' },
-            exposureMode: { ideal: 'continuous' },
-            whiteBalanceMode: { ideal: 'continuous' },
           }
         };
 
@@ -147,51 +165,36 @@
         videoEl.srcObject = stream;
         await videoEl.play();
 
-        // Try to enable torch (flash) for better lighting on supported devices
         const track = stream.getVideoTracks()[0];
         const capabilities = track.getCapabilities ? track.getCapabilities() : {};
 
-        // Set up ImageCapture API for high-res still frames
         if (typeof ImageCapture !== 'undefined') {
           imageCapture = new ImageCapture(track);
         }
 
-        // Apply optimal camera settings if supported
         if (track.applyConstraints) {
           try {
-            const advancedConstraints = {};
-            if (capabilities.focusMode && capabilities.focusMode.includes('continuous')) {
-              advancedConstraints.focusMode = 'continuous';
-            }
-            if (capabilities.exposureMode) {
-              advancedConstraints.exposureMode = 'continuous';
-            }
-            if (Object.keys(advancedConstraints).length > 0) {
-              await track.applyConstraints({ advanced: [advancedConstraints] });
-            }
-          } catch (e) {
-            // Not all devices support advanced constraints — that's fine
-          }
+            const adv = {};
+            if (capabilities.focusMode && capabilities.focusMode.includes('continuous')) adv.focusMode = 'continuous';
+            if (capabilities.exposureMode) adv.exposureMode = 'continuous';
+            if (Object.keys(adv).length > 0) await track.applyConstraints({ advanced: [adv] });
+          } catch (e) { /* unsupported — fine */ }
         }
 
-        // Periodically trigger refocus by briefly switching focus mode
-        // This combats the phone "locking" focus on the wrong distance
-        setInterval(() => cycleFocus(track, capabilities), FOCUS_CYCLE_MS);
+        // Focus cycling — store interval ID for cleanup
+        if (focusIntervalId) clearInterval(focusIntervalId);
+        focusIntervalId = setInterval(() => cycleFocus(track, capabilities), FOCUS_CYCLE_MS);
 
         setGuidance('Position the barcode inside the frame');
       } catch (err) {
         document.body.innerHTML = `<div class="error">
           <h2>Camera access needed</h2>
-          <p>${err.message}</p>
+          <p>${esc(err.message)}</p>
           <p style="margin-top:1rem">Allow camera access, then reload.</p>
         </div>`;
       }
     }
 
-    /**
-     * Focus cycling trick: briefly switch to manual focus then back to continuous.
-     * Forces the camera to re-evaluate focus, improving chances on small codes.
-     */
     async function cycleFocus(track, capabilities) {
       if (!capabilities.focusMode || !capabilities.focusMode.includes('continuous')) return;
       try {
@@ -204,20 +207,14 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // LAYER 1: CLIENT-SIDE LIVE DECODE (ZXing on video frames)
-    // Fast path — works for clean, well-lit, well-aligned codes
+    // LAYER 1: LIVE ZXing DECODE
     // ═══════════════════════════════════════════════════════════════
     function startLiveDecoder() {
       codeReader = new ZXingBrowser.BrowserMultiFormatReader();
-
-      // ZXing hints for pharma barcodes
       const hints = new Map();
-      // Prioritize Data Matrix + Code 128 + EAN-13 (most common pharma formats)
-      // but still support all formats
-      hints.set(2, true); // TRY_HARDER — spend more CPU for better decode rate
-
+      hints.set(2, true);
       codeReader.hints = hints;
-      codeReader.timeBetweenDecodingAttempts = 150; // ~7 FPS decode rate
+      codeReader.timeBetweenDecodingAttempts = 150;
 
       codeReader.decodeFromVideoElement(videoEl, (result, err) => {
         if (result) {
@@ -230,8 +227,7 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // LAYER 2: CLIENT-SIDE ENHANCED DECODE (Canvas preprocessing)
-    // When live decode fails, try preprocessing on the client first
+    // LAYER 2: CLIENT-SIDE ENHANCED DECODE
     // ═══════════════════════════════════════════════════════════════
     async function clientEnhancedDecode() {
       const frame = captureVideoFrame();
@@ -242,25 +238,19 @@
       processCanvas.width = width;
       processCanvas.height = height;
 
-      // Try multiple client-side preprocessing strategies
       const strategies = [
-        // Strategy 1: Grayscale + sharpen (convolution kernel)
         () => {
           ctx.drawImage(frame.source, 0, 0, width, height);
           const imageData = ctx.getImageData(0, 0, width, height);
-          grayscale(imageData);
-          sharpen(imageData, width, height);
+          grayscale(imageData); sharpen(imageData, width, height);
           ctx.putImageData(imageData, 0, 0);
         },
-        // Strategy 2: High contrast threshold
         () => {
           ctx.drawImage(frame.source, 0, 0, width, height);
           const imageData = ctx.getImageData(0, 0, width, height);
-          grayscale(imageData);
-          threshold(imageData, 128);
+          grayscale(imageData); threshold(imageData, 128);
           ctx.putImageData(imageData, 0, 0);
         },
-        // Strategy 3: Center crop + scale up (for small codes)
         () => {
           const cropW = Math.round(width * 0.4);
           const cropH = Math.round(height * 0.4);
@@ -272,62 +262,45 @@
           ctx.imageSmoothingQuality = 'high';
           ctx.drawImage(frame.source, sx, sy, cropW, cropH, 0, 0, cropW * 2, cropH * 2);
           const imageData = ctx.getImageData(0, 0, cropW * 2, cropH * 2);
-          grayscale(imageData);
-          sharpen(imageData, cropW * 2, cropH * 2);
+          grayscale(imageData); sharpen(imageData, cropW * 2, cropH * 2);
           ctx.putImageData(imageData, 0, 0);
         },
-        // Strategy 4: Invert (dark packaging)
         () => {
           ctx.drawImage(frame.source, 0, 0, width, height);
           const imageData = ctx.getImageData(0, 0, width, height);
-          grayscale(imageData);
-          invert(imageData);
-          threshold(imageData, 128);
+          grayscale(imageData); invertPixels(imageData); threshold(imageData, 128);
           ctx.putImageData(imageData, 0, 0);
         },
       ];
 
-      const singleReader = new ZXingBrowser.BrowserMultiFormatReader();
-      const hints = new Map();
-      hints.set(2, true); // TRY_HARDER
-      singleReader.hints = hints;
-
       for (const strategy of strategies) {
         try {
           strategy();
-          const result = await decodeFromCanvas(singleReader, processCanvas);
+          const result = await decodeFromCanvas(enhancedReader, processCanvas);
           if (result) return result;
-        } catch (e) { /* strategy failed, try next */ }
+        } catch (e) { /* try next */ }
       }
-
       return null;
     }
 
     function decodeFromCanvas(reader, canvas) {
       return new Promise((resolve) => {
         try {
-          // Create an image from canvas and decode
           const img = new Image();
           img.onload = async () => {
             try {
               const result = await reader.decodeFromImageElement(img);
               resolve({ text: result.getText(), format: result.getBarcodeFormat() });
-            } catch {
-              resolve(null);
-            }
+            } catch { resolve(null); }
           };
           img.onerror = () => resolve(null);
           img.src = canvas.toDataURL('image/png');
-        } catch {
-          resolve(null);
-        }
+        } catch { resolve(null); }
       });
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // LAYER 3: SERVER-SIDE DECODE (Sharp preprocessing pipeline)
-    // Heavy artillery — sends frame to server for 10+ preprocessing
-    // variants, then tries to decode each one client-side
+    // LAYER 3: SERVER-SIDE DECODE
     // ═══════════════════════════════════════════════════════════════
     async function serverSideDecode(trigger) {
       if (isServerDecoding) return;
@@ -340,14 +313,9 @@
       setGuidance('Processing — hold steady...', true);
 
       try {
-        // Capture the best frame we can get
         const frameData = await captureHighResFrame();
-        if (!frameData) {
-          setGuidance('Capture failed — try again');
-          return;
-        }
+        if (!frameData) { setGuidance('Capture failed — try again'); return; }
 
-        // Send to server for preprocessing
         const response = await fetch('/api/decode-image', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -355,21 +323,13 @@
         });
 
         if (!response.ok) throw new Error('Server error');
-
         const { quality, variants } = await response.json();
 
-        // Show quality feedback
         if (quality.sharpness < 20) {
           setGuidance('Image is blurry — hold phone steadier', true);
         } else if (quality.sharpness < 40) {
           setGuidance('Trying enhanced decode...', true);
         }
-
-        // Try to decode each server-processed variant
-        const singleReader = new ZXingBrowser.BrowserMultiFormatReader();
-        const hints = new Map();
-        hints.set(2, true);
-        singleReader.hints = hints;
 
         for (const variant of variants) {
           try {
@@ -381,20 +341,16 @@
             img.src = variant.dataUrl;
             await loaded;
 
-            const result = await singleReader.decodeFromImageElement(img);
+            const result = await enhancedReader.decodeFromImageElement(img);
             if (result) {
               handleScan(result.getText(), result.getBarcodeFormat(), `server:${variant.name}`);
               setGuidance(`Decoded via ${variant.name}`);
-              return; // Success!
+              return;
             }
-          } catch {
-            // This variant didn't work, try next
-          }
+          } catch { /* try next variant */ }
         }
 
-        // All variants failed
         setGuidance('Could not decode — move closer or improve lighting', true);
-
       } catch (err) {
         console.error('Server decode error:', err);
         setGuidance('Processing error — try again');
@@ -407,43 +363,24 @@
       }
     }
 
-    /**
-     * Capture a high-resolution still frame.
-     * Uses ImageCapture API when available (gets a full-res photo, not a video frame).
-     * Falls back to canvas capture from video.
-     */
     async function captureHighResFrame() {
-      // Method 1: ImageCapture API — gets a real camera still (much higher res)
       if (imageCapture) {
         try {
-          const blob = await imageCapture.takePhoto({
-            imageWidth: 3264,  // Request high res
-            imageHeight: 2448,
-          });
+          const blob = await imageCapture.takePhoto({ imageWidth: 3264, imageHeight: 2448 });
           return await blobToDataUrl(blob);
-        } catch (e) {
-          // ImageCapture may fail on some devices; fall through to canvas
-        }
+        } catch (e) { /* fall through */ }
       }
-
-      // Method 2: Grab from video via canvas (lower res but reliable)
       const frame = captureVideoFrame();
       if (!frame) return null;
-
       captureCanvas.width = frame.width;
       captureCanvas.height = frame.height;
-      const ctx = captureCanvas.getContext('2d');
-      ctx.drawImage(frame.source, 0, 0);
+      captureCanvas.getContext('2d').drawImage(frame.source, 0, 0);
       return captureCanvas.toDataURL('image/jpeg', 0.95);
     }
 
     function captureVideoFrame() {
       if (!videoEl.videoWidth) return null;
-      return {
-        source: videoEl,
-        width: videoEl.videoWidth,
-        height: videoEl.videoHeight
-      };
+      return { source: videoEl, width: videoEl.videoWidth, height: videoEl.videoHeight };
     }
 
     function blobToDataUrl(blob) {
@@ -456,14 +393,14 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // FAILURE MONITOR — auto-escalates through decode layers
+    // FAILURE MONITOR
     // ═══════════════════════════════════════════════════════════════
     function startFailureMonitor() {
-      setInterval(async () => {
+      if (failureMonitorId) clearInterval(failureMonitorId);
+      failureMonitorId = setInterval(async () => {
         if (failedFrameCount < FAILED_FRAMES_BEFORE_SERVER) return;
         if (isServerDecoding) return;
 
-        // Layer 2: Try client-side enhanced decode first
         setGuidance('Trying enhanced processing...');
         const enhanced = await clientEnhancedDecode();
         if (enhanced) {
@@ -472,15 +409,13 @@
           return;
         }
 
-        // Layer 3: Escalate to server
-        failedFrameCount = 0; // Reset to avoid spamming
+        failedFrameCount = 0;
         await serverSideDecode('auto');
-
       }, SERVER_DECODE_INTERVAL);
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // IMAGE PROCESSING FUNCTIONS (client-side Canvas operations)
+    // IMAGE PROCESSING
     // ═══════════════════════════════════════════════════════════════
     function grayscale(imageData) {
       const d = imageData.data;
@@ -498,21 +433,17 @@
       }
     }
 
-    function invert(imageData) {
+    function invertPixels(imageData) {
       const d = imageData.data;
       for (let i = 0; i < d.length; i += 4) {
-        d[i] = 255 - d[i];
-        d[i + 1] = 255 - d[i + 1];
-        d[i + 2] = 255 - d[i + 2];
+        d[i] = 255 - d[i]; d[i + 1] = 255 - d[i + 1]; d[i + 2] = 255 - d[i + 2];
       }
     }
 
     function sharpen(imageData, w, h) {
-      // 3x3 unsharp mask kernel
       const d = imageData.data;
       const copy = new Uint8ClampedArray(d);
       const kernel = [0, -1, 0, -1, 5, -1, 0, -1, 0];
-
       for (let y = 1; y < h - 1; y++) {
         for (let x = 1; x < w - 1; x++) {
           const idx = (y * w + x) * 4;
@@ -520,8 +451,7 @@
             let sum = 0;
             for (let ky = -1; ky <= 1; ky++) {
               for (let kx = -1; kx <= 1; kx++) {
-                const kidx = ((y + ky) * w + (x + kx)) * 4 + c;
-                sum += copy[kidx] * kernel[(ky + 1) * 3 + (kx + 1)];
+                sum += copy[((y + ky) * w + (x + kx)) * 4 + c] * kernel[(ky + 1) * 3 + (kx + 1)];
               }
             }
             d[idx + c] = Math.min(255, Math.max(0, sum));
@@ -535,22 +465,42 @@
     // ═══════════════════════════════════════════════════════════════
     function connectWebSocket() {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      ws = new WebSocket(`${protocol}//${window.location.host}?session=${sessionId}&role=phone`);
+      ws = new WebSocket(`${protocol}//${window.location.host}?session=${sessionId}&role=phone&token=${sessionToken}`);
 
       ws.onopen = () => {
         statusEl.textContent = 'Connected to desktop';
         statusEl.classList.add('ok');
+        reconnectAttempts = 0;
       };
 
       ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
+        let msg;
+        try { msg = JSON.parse(event.data); } catch { return; }
         if (msg.type === 'scan-result') showScanResult(msg);
       };
 
-      ws.onclose = () => {
-        statusEl.textContent = 'Disconnected — reconnecting...';
+      ws.onclose = (event) => {
         statusEl.classList.remove('ok');
-        setTimeout(() => connectWebSocket(), 2000);
+
+        // Session expired or invalid token — stop reconnecting
+        if (event.code === 4001 || event.code === 4002) {
+          statusEl.textContent = 'Session expired — scan the QR code again';
+          return;
+        }
+        // Too many phones
+        if (event.code === 4005) {
+          statusEl.textContent = 'Too many phones connected to this session';
+          return;
+        }
+
+        if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+          reconnectAttempts++;
+          const delay = Math.min(2000 * reconnectAttempts, 15000);
+          statusEl.textContent = `Reconnecting (${reconnectAttempts})...`;
+          setTimeout(() => connectWebSocket(), delay);
+        } else {
+          statusEl.textContent = 'Disconnected — scan QR code again';
+        }
       };
     }
 
@@ -564,36 +514,30 @@
       scanCountEl.textContent = `${scanCount} scan${scanCount !== 1 ? 's' : ''}`;
       failedFrameCount = 0;
 
-      // Visual + haptic feedback
       overlayEl.classList.add('scanned');
       setTimeout(() => overlayEl.classList.remove('scanned'), 600);
       if (navigator.vibrate) navigator.vibrate(100);
-
       setGuidance(`Decoded (${method})`);
 
-      // Send to server
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          type: 'scan',
-          barcode,
-          format: formatName(format),
-          method
-        }));
-      }
+      try {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'scan', barcode, format: formatName(format), method }));
+        }
+      } catch (e) { /* connection closing */ }
     }
 
     function showScanResult(msg) {
       const m = msg.medicine;
       if (m && m.found) {
         lastScanEl.innerHTML = `
-          <div class="name">${m.name || 'Medicine Data Found'}</div>
-          <div class="barcode">${msg.barcode}</div>
-          <div class="info">${[m.manufacturer, m.strength, m.form].filter(Boolean).join(' — ') || 'Sent to desktop'}</div>
+          <div class="name">${esc(m.name || 'Medicine Data Found')}</div>
+          <div class="barcode">${esc(msg.barcode)}</div>
+          <div class="info">${esc([m.manufacturer, m.strength, m.form].filter(Boolean).join(' — ') || 'Sent to desktop')}</div>
         `;
       } else {
         lastScanEl.innerHTML = `
           <div class="name">Barcode Scanned</div>
-          <div class="barcode">${msg.barcode}</div>
+          <div class="barcode">${esc(msg.barcode)}</div>
           <div class="info">Sent to desktop</div>
         `;
       }
